@@ -1,6 +1,6 @@
 # Local RAG Knowledge Pipeline
 
-A self-hosted backend foundation for a future single-server Retrieval-Augmented Generation system. Phase 1 establishes the API, PostgreSQL schema, migrations, authentication, observability, container workflow, and tests. It does **not** ingest or retrieve documents yet.
+A self-hosted knowledge pipeline for a future single-server Retrieval-Augmented Generation system. Phase 2 adds synchronous, local ingestion for TXT, Markdown, and text-based PDF documents. Retrieval and generation are **not** implemented yet.
 
 ## Phase 1 architecture
 
@@ -23,10 +23,16 @@ The `/ready` endpoint is intentionally protected because it reports infrastructu
 - JSON structured logging
 - Python 3.12 container with one Uvicorn worker
 - Unit tests plus PostgreSQL migration integration tests
+- Authenticated synchronous `POST /documents/upload`
+- TXT, Markdown, and text-based PDF extraction with page/heading metadata
+- Configurable recursive character chunking and deterministic SHA-256 hashes
+- Content-based duplicate detection with `409 Conflict`
+- Safe UUID-based source storage and cleanup on failed ingestion
+- Authenticated document list and detail endpoints
 
 ## Not implemented yet
 
-Document parsing/ingestion, semantic chunking, Ollama embeddings, FAISS, BM25, rank fusion, reranking, grounded generation, citations, streaming, Celery, Redis, and evaluation are planned for later phases.
+OCR, repository/CSV/JSON ingestion, semantic chunking, Ollama embeddings, FAISS, BM25, rank fusion, reranking, grounded generation, citations, streaming, Celery, Redis, and evaluation are planned for later phases.
 
 ## Prerequisites
 
@@ -48,7 +54,32 @@ Then start the stack:
 docker compose up --build
 ```
 
-The API container runs `alembic upgrade head` before starting Uvicorn. PostgreSQL data is retained in the `postgres_data` volume.
+The API container runs `alembic upgrade head` before starting Uvicorn. PostgreSQL data and source documents are retained in the `postgres_data` and `document_storage` volumes.
+
+## Ingestion configuration
+
+The defaults are a 10 MB upload limit, 1,000-character chunks, and 150-character overlap. Override `MAX_UPLOAD_SIZE_MB`, `CHUNK_SIZE`, and `CHUNK_OVERLAP` in `.env`; overlap must be smaller than chunk size. Only `.txt`, `.md`, and `.pdf` files are accepted. PDFs must contain extractable text because OCR is intentionally out of scope.
+
+Upload a document with curl:
+
+```bash
+curl -X POST http://localhost:8000/documents/upload \
+  -H "X-API-Key: your-api-key" \
+  -F "file=@example.pdf"
+```
+
+PowerShell equivalent:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/documents/upload `
+  -Headers @{"X-API-Key"="your-api-key"} -Form @{file=Get-Item .\example.pdf}
+```
+
+List indexed documents without returning chunk text:
+
+```bash
+curl -H "X-API-Key: your-api-key" http://localhost:8000/documents
+```
 
 ## Local Python setup
 
@@ -110,6 +141,10 @@ curl -H "X-API-Key: your-api-key" http://localhost:8000/ready
 
 Missing or invalid keys return `401`. A database failure returns `503` with a sanitized message.
 
+## Current limitations
+
+Ingestion is synchronous, PDFs are not OCR-processed, and there is no delete endpoint. No embeddings, retrieval index, question answering, or generated responses exist in Phase 2.
+
 ## Next phase
 
-Build document ingestion and parsing on this schema, keeping retrieval and generation concerns out of the ingestion path until their dedicated phases.
+Add local embeddings and retrieval indexing as a separate phase, using the persisted chunks without changing the ingestion API contract.

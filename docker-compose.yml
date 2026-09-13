@@ -24,8 +24,14 @@ services:
       API_KEY: ${API_KEY:?Set API_KEY in .env}
       DATABASE_URL: postgresql+psycopg://rag:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/rag_db
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-10}
+      CHUNK_SIZE: ${CHUNK_SIZE:-1000}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-150}
+      STORAGE_ROOT: /app/storage/documents
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      - document_storage:/app/storage/documents
     depends_on:
       postgres:
         condition: service_healthy
@@ -33,3 +39,4 @@ services:
 
 volumes:
   postgres_data:
+  document_storage:

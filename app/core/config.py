@@ -1,9 +1,10 @@
 """Typed environment-backed application settings."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +21,16 @@ class Settings(BaseSettings):
     api_key: SecretStr = Field(min_length=1)
     database_url: str = Field(min_length=1)
     log_level: str = "INFO"
+    max_upload_size_mb: int = Field(default=10, gt=0)
+    chunk_size: int = Field(default=1000, gt=0)
+    chunk_overlap: int = Field(default=150, ge=0)
+    storage_root: Path = Path("storage/documents")
+
+    @model_validator(mode="after")
+    def validate_chunking(self) -> "Settings":
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE")
+        return self
 
 
 @lru_cache

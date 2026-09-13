@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 
 from fastapi import FastAPI
 
+from app.api.documents import router as documents_router
 from app.api.health import router as health_router
 from app.core.config import settings
 from app.core.logging import configure_logging
@@ -23,3 +24,4 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.include_router(health_router)
+app.include_router(documents_router)

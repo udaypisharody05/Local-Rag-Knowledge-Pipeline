@@ -12,6 +12,7 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY --chown=app:app . .
+RUN mkdir -p /app/storage/documents && chown -R app:app /app/storage
 USER app
 
 EXPOSE 8000
