@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     ollama_timeout_seconds: float = Field(default=60.0, gt=0)
     dense_top_k: int = Field(default=5, gt=0)
     dense_max_k: int = Field(default=20, gt=0)
+    sparse_top_k: int = Field(default=5, gt=0)
+    sparse_max_k: int = Field(default=20, gt=0)
+    dense_candidate_k: int = Field(default=20, gt=0)
+    sparse_candidate_k: int = Field(default=20, gt=0)
+    hybrid_top_k: int = Field(default=5, gt=0)
+    hybrid_max_k: int = Field(default=20, gt=0)
+    rrf_k: int = Field(default=60, gt=0)
     index_storage_root: Path = Path("storage/indexes/versions")
 
     @model_validator(mode="after")
@@ -39,6 +46,10 @@ class Settings(BaseSettings):
             raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE")
         if self.dense_top_k > self.dense_max_k:
             raise ValueError("DENSE_TOP_K must not exceed DENSE_MAX_K")
+        if self.sparse_top_k > self.sparse_max_k:
+            raise ValueError("SPARSE_TOP_K must not exceed SPARSE_MAX_K")
+        if self.hybrid_top_k > self.hybrid_max_k:
+            raise ValueError("HYBRID_TOP_K must not exceed HYBRID_MAX_K")
         return self
 
 

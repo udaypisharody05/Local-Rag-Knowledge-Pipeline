@@ -1,0 +1,2 @@
+FAISS performs vector similarity search over dense embeddings.
+This project uses IndexFlatIP with L2-normalized vectors so inner product represents cosine similarity.

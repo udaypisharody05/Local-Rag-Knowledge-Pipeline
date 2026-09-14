@@ -1,4 +1,4 @@
-"""Dense retrieval API schemas."""
+"""Dense, sparse, and hybrid retrieval API schemas."""
 
 from uuid import UUID
 
@@ -44,8 +44,52 @@ class DenseSearchResponse(BaseModel):
     results: list[DenseSearchResult]
 
 
+class SparseSearchRequest(DenseSearchRequest):
+    pass
+
+
+class SparseSearchResult(DenseSearchResult):
+    pass
+
+
+class SparseSearchResponse(BaseModel):
+    query: str
+    snapshot_version: int
+    results: list[SparseSearchResult]
+
+
+class HybridSearchRequest(DenseSearchRequest):
+    pass
+
+
+class HybridSearchResult(BaseModel):
+    rank: int
+    rrf_score: float
+    dense_rank: int | None
+    dense_score: float | None
+    sparse_rank: int | None
+    sparse_score: float | None
+    chunk_id: UUID
+    document_id: UUID
+    text: str
+    source_name: str
+    source_type: str
+    page_number: int | None
+    section_title: str | None
+
+
+class HybridSearchResponse(BaseModel):
+    query: str
+    snapshot_version: int
+    fusion: str
+    results: list[HybridSearchResult]
+
+
 class RetrievalStatusResponse(BaseModel):
     available: bool
+    dense_available: bool
+    sparse_available: bool
+    fusion_strategy: str | None
     snapshot_version: int | None
     chunk_count: int | None = None
     embedding_model: str | None = None

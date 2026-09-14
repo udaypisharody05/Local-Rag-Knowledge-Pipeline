@@ -1,4 +1,4 @@
-"""Snapshot rebuild, activation, startup loading, and dense search."""
+"""Combined snapshot rebuild, activation, and dense/sparse/hybrid search."""
 
 import hashlib
 import logging
@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session
 from app.embeddings import EmbeddingError, EmbeddingProvider
 from app.models import Document, DocumentChunk, RetrievalIndexVersion
 from app.retrieval.dense import FaissStore, FaissStoreError
+from app.retrieval.fusion import RankedCandidate, reciprocal_rank_fusion
+from app.retrieval.sparse import BM25Store, SparseStoreError
 from app.retrieval.snapshot import (
     DenseSnapshot,
     SnapshotError,
@@ -55,6 +57,23 @@ class SearchHit:
     section_title: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class HybridSearchHit:
+    rank: int
+    rrf_score: float
+    dense_rank: int | None
+    dense_score: float | None
+    sparse_rank: int | None
+    sparse_score: float | None
+    chunk_id: UUID
+    document_id: UUID
+    text: str
+    source_name: str
+    source_type: str
+    page_number: int | None
+    section_title: str | None
+
+
 class RetrievalService:
     def __init__(
         self,
@@ -62,12 +81,14 @@ class RetrievalService:
         provider: EmbeddingProvider,
         storage_root: Path,
         manager: SnapshotManager,
+        rrf_k: int = 60,
     ) -> None:
         self.db = db
         self.provider = provider
         self.storage_root = storage_root
         self._storage: SnapshotStorage | None = None
         self.manager = manager
+        self.rrf_k = rrf_k
 
     @property
     def storage(self) -> SnapshotStorage:
@@ -108,14 +129,20 @@ class RetrievalService:
             version_row_id = version_row.id
 
             chunks = [chunk for chunk, _ in rows]
-            vectors = self.provider.embed_documents([chunk.text_content for chunk in chunks])
+            texts = [chunk.text_content for chunk in chunks]
+            vectors = self.provider.embed_documents(texts)
             store = FaissStore.build(vectors)
+            sparse_store = BM25Store.build(texts)
+            chunk_ids = tuple(chunk.id for chunk in chunks)
             snapshot = DenseSnapshot(
                 version=version,
                 store=store,
-                chunk_ids=tuple(chunk.id for chunk in chunks),
+                chunk_ids=chunk_ids,
                 embedding_model=self.provider.model,
                 embedding_dimension=store.dimension,
+                sparse_store=sparse_store,
+                sparse_chunk_ids=chunk_ids,
+                rrf_k=self.rrf_k,
             )
             self._validate_mapping(snapshot)
             self.storage.save_atomic(snapshot, chunking_config_hashes=config_hashes)
@@ -148,7 +175,7 @@ class RetrievalService:
         except EmbeddingError as exc:
             self._record_failure(version_row_id, version, "Embedding service failed")
             raise RetrievalError(503, str(exc)) from None
-        except (SnapshotError, FaissStoreError):
+        except (SnapshotError, FaissStoreError, SparseStoreError):
             logger.exception("retrieval_snapshot_build_failed version=%s", version)
             self._record_failure(version_row_id, version, "Snapshot validation failed")
             raise RetrievalError(500, "Retrieval snapshot build failed") from None
@@ -176,35 +203,78 @@ class RetrievalService:
             raise RetrievalError(503, str(exc)) from None
 
         mapped_ids = [snapshot.chunk_ids[match.position] for match in matches]
-        try:
-            rows = self.db.execute(
-                select(DocumentChunk, Document)
-                .join(Document)
-                .where(
-                    DocumentChunk.id.in_(mapped_ids),
-                    Document.deleted_at.is_(None),
-                    Document.status != "DELETED",
-                )
-            ).all()
-        except SQLAlchemyError:
-            logger.exception("dense_search_database_lookup_failed version=%d", snapshot.version)
-            raise RetrievalError(500, "Dense search failed") from None
-        canonical = {chunk.id: (chunk, document) for chunk, document in rows}
+        canonical = self._hydrate(mapped_ids, snapshot.version, "dense")
         hits: list[SearchHit] = []
         for match, chunk_id in zip(matches, mapped_ids, strict=True):
             row = canonical.get(chunk_id)
             if row is None:
-                logger.error(
-                    "retrieval_snapshot_stale_mapping version=%d chunk_id=%s",
-                    snapshot.version,
-                    chunk_id,
-                )
+                self._log_stale(snapshot.version, chunk_id)
+                continue
+            hits.append(self._search_hit(len(hits) + 1, match.score, row))
+        return snapshot.version, hits
+
+    def search_sparse(self, query: str, k: int) -> tuple[int, list[SearchHit]]:
+        snapshot = self._active_snapshot()
+        matches = snapshot.sparse_store.search(query, k)
+        mapped_ids = [snapshot.sparse_chunk_ids[match.position] for match in matches]
+        canonical = self._hydrate(mapped_ids, snapshot.version, "sparse")
+        hits: list[SearchHit] = []
+        for match, chunk_id in zip(matches, mapped_ids, strict=True):
+            row = canonical.get(chunk_id)
+            if row is None:
+                self._log_stale(snapshot.version, chunk_id)
+                continue
+            hits.append(self._search_hit(len(hits) + 1, match.score, row))
+        return snapshot.version, hits
+
+    def search_hybrid(
+        self,
+        query: str,
+        k: int,
+        dense_candidate_k: int,
+        sparse_candidate_k: int,
+    ) -> tuple[int, list[HybridSearchHit]]:
+        snapshot = self._active_snapshot()
+        if self.provider.model != snapshot.embedding_model:
+            raise RetrievalError(
+                503, "Configured embedding model does not match the active retrieval index"
+            )
+        try:
+            dense_matches = snapshot.store.search(
+                self.provider.embed_query(query), dense_candidate_k
+            )
+        except EmbeddingError as exc:
+            raise RetrievalError(503, str(exc)) from None
+        except FaissStoreError as exc:
+            raise RetrievalError(503, str(exc)) from None
+        sparse_matches = snapshot.sparse_store.search(query, sparse_candidate_k)
+        dense = [
+            RankedCandidate(snapshot.chunk_ids[item.position], rank, item.score)
+            for rank, item in enumerate(dense_matches, start=1)
+        ]
+        sparse = [
+            RankedCandidate(snapshot.sparse_chunk_ids[item.position], rank, item.score)
+            for rank, item in enumerate(sparse_matches, start=1)
+        ]
+        fused = reciprocal_rank_fusion(dense, sparse, snapshot.rrf_k)[:k]
+        canonical = self._hydrate(
+            [item.chunk_id for item in fused], snapshot.version, "hybrid"
+        )
+        hits: list[HybridSearchHit] = []
+        for item in fused:
+            row = canonical.get(item.chunk_id)
+            if row is None:
+                self._log_stale(snapshot.version, item.chunk_id)
                 continue
             chunk, document = row
             hits.append(
-                SearchHit(
+                HybridSearchHit(
                     rank=len(hits) + 1,
-                    score=match.score,
+                    rrf_score=item.rrf_score,
+                    dense_rank=item.dense_rank,
+                    dense_score=item.dense_score,
+                    sparse_rank=item.sparse_rank,
+                    sparse_score=item.sparse_score,
                     chunk_id=chunk.id,
                     document_id=document.id,
                     text=chunk.text_content,
@@ -216,9 +286,68 @@ class RetrievalService:
             )
         return snapshot.version, hits
 
+    def _active_snapshot(self) -> DenseSnapshot:
+        snapshot = self.manager.get()
+        if snapshot is None:
+            raise RetrievalError(503, "No active retrieval index is loaded")
+        return snapshot
+
+    def _hydrate(
+        self, mapped_ids: list[UUID], version: int, search_type: str
+    ) -> dict[UUID, tuple[DocumentChunk, Document]]:
+        if not mapped_ids:
+            return {}
+        try:
+            rows = self.db.execute(
+                select(DocumentChunk, Document)
+                .join(Document)
+                .where(
+                    DocumentChunk.id.in_(mapped_ids),
+                    Document.deleted_at.is_(None),
+                    Document.status != "DELETED",
+                )
+            ).all()
+        except SQLAlchemyError:
+            logger.exception("%s_search_database_lookup_failed version=%d", search_type, version)
+            raise RetrievalError(500, f"{search_type.capitalize()} search failed") from None
+        return {chunk.id: (chunk, document) for chunk, document in rows}
+
+    @staticmethod
+    def _search_hit(
+        rank: int, score: float, row: tuple[DocumentChunk, Document]
+    ) -> SearchHit:
+        chunk, document = row
+        return SearchHit(
+            rank=rank,
+            score=score,
+            chunk_id=chunk.id,
+            document_id=document.id,
+            text=chunk.text_content,
+            source_name=document.source_name,
+            source_type=document.source_type,
+            page_number=chunk.page_number,
+            section_title=chunk.section_title,
+        )
+
+    @staticmethod
+    def _log_stale(version: int, chunk_id: UUID) -> None:
+        logger.error(
+            "retrieval_snapshot_stale_mapping version=%d chunk_id=%s", version, chunk_id
+        )
+
     def _validate_mapping(self, snapshot: DenseSnapshot) -> None:
         if snapshot.store.count != snapshot.chunk_count:
             raise SnapshotError("FAISS and mapping counts are inconsistent")
+        if snapshot.sparse_store.count != len(snapshot.sparse_chunk_ids):
+            raise SnapshotError("BM25 and sparse mapping counts are inconsistent")
+        if snapshot.sparse_store.count != snapshot.chunk_count:
+            raise SnapshotError("Dense and sparse snapshot counts are inconsistent")
+        if len(set(snapshot.chunk_ids)) != snapshot.chunk_count:
+            raise SnapshotError("Dense mapping contains duplicate chunks")
+        if len(set(snapshot.sparse_chunk_ids)) != snapshot.chunk_count:
+            raise SnapshotError("Sparse mapping contains duplicate chunks")
+        if set(snapshot.chunk_ids) != set(snapshot.sparse_chunk_ids):
+            raise SnapshotError("Dense and sparse mappings contain different chunks")
         valid_ids = set(
             self.db.scalars(
                 select(DocumentChunk.id)

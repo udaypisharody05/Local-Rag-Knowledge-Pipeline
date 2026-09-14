@@ -1,0 +1,2 @@
+PostgreSQL stores all document metadata and chunks.
+The retrieval_index_versions table tracks immutable retrieval snapshots and their activation state.

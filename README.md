@@ -1,6 +1,6 @@
 # Local RAG Knowledge Pipeline
 
-A self-hosted knowledge pipeline for a future single-server Retrieval-Augmented Generation system. Phase 3 adds local Ollama embeddings and persistent exact dense retrieval over ingested TXT, Markdown, and text-based PDF documents. Answer generation is **not** implemented yet.
+A self-hosted knowledge pipeline for a future single-server Retrieval-Augmented Generation system. Phase 4 combines local semantic and keyword retrieval over ingested TXT, Markdown, and text-based PDF documents. Answer generation is **not** implemented yet.
 
 ## Phase 1 architecture
 
@@ -32,11 +32,14 @@ The `/ready` endpoint is intentionally protected because it reports infrastructu
 - Local, configurable Ollama embeddings through the direct `/api/embed` HTTP API
 - Exact FAISS `IndexFlatIP` search using L2-normalized vectors for cosine similarity
 - Immutable, persistent, versioned retrieval snapshots with PostgreSQL-controlled activation
-- Protected snapshot rebuild, dense-search, and retrieval-status endpoints
+- Deterministic BM25 keyword retrieval with technical-identifier-aware tokenization
+- Reciprocal Rank Fusion (RRF) hybrid search over dense and sparse rankings
+- One immutable snapshot version containing both FAISS and safely persisted BM25 data
+- Protected snapshot rebuild, dense-, sparse-, hybrid-search, and retrieval-status endpoints
 
 ## Not implemented yet
 
-OCR, repository/CSV/JSON ingestion, semantic chunking, BM25, rank fusion, hybrid retrieval, reranking, grounded LLM answer generation, citations, streaming, asynchronous indexing, Celery, Redis, and evaluation are planned for later phases.
+OCR, repository/CSV/JSON ingestion, semantic chunking, reranking, grounded LLM answer generation, citations in generated answers, streaming, asynchronous ingestion/indexing, Celery, Redis, and evaluation are planned for later phases.
 
 ## Prerequisites
 
@@ -85,7 +88,7 @@ List indexed documents without returning chunk text:
 curl -H "X-API-Key: your-api-key" http://localhost:8000/documents
 ```
 
-## Local Ollama and dense retrieval
+## Local Ollama and hybrid retrieval
 
 Install Ollama separately on the host, start it, and pull the configured local embedding model:
 
@@ -104,7 +107,7 @@ curl -X POST http://localhost:8000/retrieval/index/rebuild \
   -H "X-API-Key: your-api-key"
 ```
 
-Every rebuild creates a new directory under `storage/indexes/versions/` containing `faiss.index`, `faiss_mapping.json`, and `manifest.json`. A temporary snapshot is validated and atomically published before PostgreSQL deprecates the previous active version and activates the new one. Existing active snapshots remain usable if a rebuild fails.
+Every rebuild creates one combined version directory under `storage/indexes/versions/`. It contains `faiss.index`, `faiss_mapping.json`, `bm25_corpus.jsonl`, `bm25_mapping.json`, and `manifest.json`. The BM25 corpus is deterministic JSONL and is reconstructed in memory at load time; Python pickle is never used. A temporary snapshot is validated and atomically published before PostgreSQL deprecates the previous active version and activates the new one. Existing active snapshots remain usable if either index build fails.
 
 Run exact dense semantic search:
 
@@ -117,6 +120,34 @@ curl -X POST http://localhost:8000/search/dense \
 
 FAISS positions map only to chunk UUIDs; returned text and source metadata are reloaded from PostgreSQL. `DENSE_TOP_K` defaults to 5 and `DENSE_MAX_K` defaults to 20. Check whether a snapshot is loaded with `GET /retrieval/status`.
 
+BM25 complements semantic retrieval when exact keywords, API paths, model names, or identifiers matter. The tokenizer lowercases text and preserves compounds such as `nomic-embed-text`, `document_id`, and `/api/embed`; it intentionally does not stem words. Run keyword search with:
+
+```bash
+curl -X POST http://localhost:8000/search/sparse \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"IndexFlatIP PostgreSQL","k":5}'
+```
+
+Hybrid search retrieves independent dense and sparse candidate lists, then combines their 1-based ranks using RRF. It does not add cosine and BM25 scores because those raw scales are incompatible. Raw component scores and ranks remain in the response for evaluation and debugging.
+
+```bash
+curl -X POST http://localhost:8000/search/hybrid \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"How are vectors searched?","k":5}'
+```
+
+PowerShell examples:
+
+```powershell
+$headers = @{"X-API-Key"="your-api-key"}
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/search/sparse -Headers $headers -ContentType "application/json" -Body '{"query":"IndexFlatIP PostgreSQL","k":5}'
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/search/hybrid -Headers $headers -ContentType "application/json" -Body '{"query":"How are vectors searched?","k":5}'
+```
+
+Configuration defaults are `SPARSE_TOP_K=5`, `SPARSE_MAX_K=20`, `DENSE_CANDIDATE_K=20`, `SPARSE_CANDIDATE_K=20`, `HYBRID_TOP_K=5`, `HYBRID_MAX_K=20`, and `RRF_K=60`. All three search endpoints report the same active snapshot version.
+
 Manual verification sequence:
 
 ```bash
@@ -126,6 +157,8 @@ docker compose exec api pytest -v
 ollama pull nomic-embed-text
 curl -X POST http://localhost:8000/retrieval/index/rebuild -H "X-API-Key: your-api-key"
 curl -X POST http://localhost:8000/search/dense -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"your question","k":5}'
+curl -X POST http://localhost:8000/search/sparse -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"IndexFlatIP PostgreSQL","k":5}'
+curl -X POST http://localhost:8000/search/hybrid -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"your question","k":5}'
 ```
 
 ## Local Python setup
@@ -190,8 +223,8 @@ Missing or invalid keys return `401`. A database failure returns `503` with a sa
 
 ## Current limitations
 
-Ingestion and index rebuilds are synchronous. PDFs are not OCR-processed, and there is no delete endpoint. Phase 3 provides dense retrieval only: BM25, hybrid fusion, reranking, LLM answer generation, citations, streaming, and asynchronous indexing are not implemented.
+Ingestion and full snapshot rebuilds are synchronous. PDFs are not OCR-processed, and there is no delete endpoint. Reranking, generated answers, citations in generated answers, streaming, and asynchronous ingestion/indexing are not implemented.
 
 ## Next phase
 
-Add BM25 and Reciprocal Rank Fusion as a separate hybrid-retrieval phase without changing the immutable dense snapshot contract.
+Evaluate dense, sparse, and hybrid retrieval before selecting and implementing a reranking approach in a later phase.

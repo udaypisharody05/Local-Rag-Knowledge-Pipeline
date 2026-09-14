@@ -19,6 +19,7 @@ from app.main import app
 from app.models import Document, DocumentChunk, RetrievalIndexVersion
 from app.retrieval import snapshot_manager
 from app.retrieval.dense import FaissStore
+from app.retrieval.sparse import BM25Store, SparseStoreError
 from app.retrieval.service import RetrievalService, load_active_snapshot
 from app.retrieval.snapshot import DenseSnapshot, SnapshotError
 
@@ -131,6 +132,8 @@ def _rebuild(client: TestClient, valid_api_key: str):
     [
         ("post", "/retrieval/index/rebuild", {}),
         ("post", "/search/dense", {"json": {"query": "query"}}),
+        ("post", "/search/sparse", {"json": {"query": "query"}}),
+        ("post", "/search/hybrid", {"json": {"query": "query"}}),
         ("get", "/retrieval/status", {}),
     ],
 )
@@ -162,6 +165,8 @@ def test_rebuild_activates_snapshot_and_creates_version_row(
     assert body["chunk_count"] == 2
     assert body["embedding_dimension"] == 2
     assert (root / f"{row.version:06d}" / "faiss.index").is_file()
+    assert (root / f"{row.version:06d}" / "bm25_corpus.jsonl").is_file()
+    assert (root / f"{row.version:06d}" / "bm25_mapping.json").is_file()
 
 
 def test_second_rebuild_deprecates_previous_snapshot(
@@ -206,6 +211,30 @@ def test_failed_rebuild_preserves_active_snapshot(
     ).status == "ACTIVATED"
 
 
+def test_failed_sparse_build_preserves_active_snapshot(
+    retrieval_environment,
+    client: TestClient,
+    valid_api_key: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, _, root = retrieval_environment
+    _add_document(session, "knowledge.txt", ["apple fruit"])
+    active_version = _rebuild(client, valid_api_key).json()["snapshot_version"]
+
+    def fail_sparse_build(cls, texts):
+        raise SparseStoreError("Deterministic sparse build failure")
+
+    monkeypatch.setattr(BM25Store, "build", classmethod(fail_sparse_build))
+    failed = _rebuild(client, valid_api_key)
+    assert failed.status_code == 500
+    assert snapshot_manager.get().version == active_version
+    newest = session.scalar(
+        select(RetrievalIndexVersion).order_by(RetrievalIndexVersion.version.desc())
+    )
+    assert newest.status == "FAILED"
+    assert not (root / f"{newest.version:06d}").exists()
+
+
 def test_dense_search_returns_ranked_postgresql_metadata(
     retrieval_environment, client: TestClient, valid_api_key: str
 ) -> None:
@@ -236,6 +265,113 @@ def test_dense_search_k_limit_is_enforced(
     assert response.status_code == 422
 
 
+def test_sparse_and_hybrid_search_return_ranked_results(
+    retrieval_environment, client: TestClient, valid_api_key: str
+) -> None:
+    session, _, _ = retrieval_environment
+    _add_document(
+        session,
+        "retrieval.txt",
+        [
+            "ocean water",
+            "IndexFlatIP searches vectors in PostgreSQL-backed retrieval",
+            "unrelated deployment guide",
+        ],
+    )
+    version = _rebuild(client, valid_api_key).json()["snapshot_version"]
+    sparse = client.post(
+        "/search/sparse",
+        headers={"X-API-Key": valid_api_key},
+        json={"query": "IndexFlatIP PostgreSQL", "k": 2},
+    )
+    hybrid = client.post(
+        "/search/hybrid",
+        headers={"X-API-Key": valid_api_key},
+        json={"query": "IndexFlatIP vectors", "k": 2},
+    )
+    assert sparse.status_code == hybrid.status_code == 200
+    assert sparse.json()["snapshot_version"] == hybrid.json()["snapshot_version"] == version
+    assert sparse.json()["results"][0]["text"].startswith("IndexFlatIP")
+    assert hybrid.json()["fusion"] == "rrf"
+    top = hybrid.json()["results"][0]
+    assert top["dense_rank"] is not None
+    assert top["sparse_rank"] is not None
+    assert top["rrf_score"] > 0
+
+
+def test_zero_score_sparse_candidate_gets_no_hybrid_sparse_rank(
+    retrieval_environment, client: TestClient, valid_api_key: str
+) -> None:
+    session, _, _ = retrieval_environment
+    _add_document(session, "zero-score.txt", ["system PostgreSQL", "meaning vectors"])
+    _rebuild(client, valid_api_key)
+    sparse = client.post(
+        "/search/sparse",
+        headers={"X-API-Key": valid_api_key},
+        json={"query": "system", "k": 2},
+    )
+    hybrid = client.post(
+        "/search/hybrid",
+        headers={"X-API-Key": valid_api_key},
+        json={"query": "system", "k": 2},
+    )
+    assert sparse.status_code == hybrid.status_code == 200
+    assert sparse.json()["results"] == []
+    postgresql_result = next(
+        item for item in hybrid.json()["results"] if item["text"] == "system PostgreSQL"
+    )
+    assert postgresql_result["dense_rank"] is not None
+    assert postgresql_result["sparse_rank"] is None
+    assert postgresql_result["sparse_score"] is None
+
+
+def test_hybrid_exposes_dense_only_sparse_only_and_shared_candidates(
+    retrieval_environment,
+    client: TestClient,
+    valid_api_key: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, _, _ = retrieval_environment
+    _add_document(
+        session,
+        "fusion.txt",
+        ["apple semantic candidate", "fruit rareterm shared", "rareterm neutral"],
+    )
+    _rebuild(client, valid_api_key)
+    monkeypatch.setattr(settings, "dense_candidate_k", 2)
+    monkeypatch.setattr(settings, "sparse_candidate_k", 2)
+    response = client.post(
+        "/search/hybrid",
+        headers={"X-API-Key": valid_api_key},
+        json={"query": "fruit rareterm", "k": 3},
+    )
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert len(results) == 3
+    assert any(item["dense_rank"] is not None and item["sparse_rank"] is None for item in results)
+    assert any(item["dense_rank"] is None and item["sparse_rank"] is not None for item in results)
+    assert any(item["dense_rank"] is not None and item["sparse_rank"] is not None for item in results)
+
+
+@pytest.mark.parametrize(
+    ("path", "limit"),
+    [("/search/sparse", "sparse_max_k"), ("/search/hybrid", "hybrid_max_k")],
+)
+def test_phase4_search_k_limits_are_enforced(
+    retrieval_environment,
+    client: TestClient,
+    valid_api_key: str,
+    path: str,
+    limit: str,
+) -> None:
+    response = client.post(
+        path,
+        headers={"X-API-Key": valid_api_key},
+        json={"query": "query", "k": getattr(settings, limit) + 1},
+    )
+    assert response.status_code == 422
+
+
 def test_dense_search_skips_content_deleted_after_snapshot(
     retrieval_environment, client: TestClient, valid_api_key: str
 ) -> None:
@@ -254,6 +390,28 @@ def test_dense_search_skips_content_deleted_after_snapshot(
     assert response.json()["results"] == []
 
 
+@pytest.mark.parametrize("path", ["/search/sparse", "/search/hybrid"])
+def test_phase4_search_skips_content_deleted_after_snapshot(
+    retrieval_environment,
+    client: TestClient,
+    valid_api_key: str,
+    path: str,
+) -> None:
+    session, _, _ = retrieval_environment
+    document = _add_document(session, "knowledge.txt", ["IndexFlatIP apple fruit"])
+    _rebuild(client, valid_api_key)
+    document.status = "DELETED"
+    document.deleted_at = datetime.now(UTC)
+    session.commit()
+    response = client.post(
+        path,
+        headers={"X-API-Key": valid_api_key},
+        json={"query": "IndexFlatIP", "k": 1},
+    )
+    assert response.status_code == 200
+    assert response.json()["results"] == []
+
+
 def test_dense_search_without_snapshot_fails_cleanly(
     retrieval_environment, client: TestClient, valid_api_key: str
 ) -> None:
@@ -264,6 +422,49 @@ def test_dense_search_without_snapshot_fails_cleanly(
         json={"query": "query"},
     )
     assert response.status_code == 503
+
+
+@pytest.mark.parametrize("path", ["/search/sparse", "/search/hybrid"])
+def test_phase4_search_without_snapshot_fails_cleanly(
+    retrieval_environment, client: TestClient, valid_api_key: str, path: str
+) -> None:
+    snapshot_manager.clear()
+    response = client.post(
+        path, headers={"X-API-Key": valid_api_key}, json={"query": "query"}
+    )
+    assert response.status_code == 503
+
+
+def test_tokenless_sparse_query_returns_empty_results(
+    retrieval_environment, client: TestClient, valid_api_key: str
+) -> None:
+    session, _, _ = retrieval_environment
+    _add_document(session, "knowledge.txt", ["apple fruit"])
+    _rebuild(client, valid_api_key)
+    response = client.post(
+        "/search/sparse",
+        headers={"X-API-Key": valid_api_key},
+        json={"query": "!!!", "k": 1},
+    )
+    assert response.status_code == 200
+    assert response.json()["results"] == []
+
+
+def test_tokenless_hybrid_query_still_uses_dense_retrieval(
+    retrieval_environment, client: TestClient, valid_api_key: str
+) -> None:
+    session, _, _ = retrieval_environment
+    _add_document(session, "knowledge.txt", ["apple fruit"])
+    _rebuild(client, valid_api_key)
+    response = client.post(
+        "/search/hybrid",
+        headers={"X-API-Key": valid_api_key},
+        json={"query": "!!!", "k": 1},
+    )
+    assert response.status_code == 200
+    result = response.json()["results"][0]
+    assert result["dense_rank"] == 1
+    assert result["sparse_rank"] is None
 
 
 def test_persisted_active_snapshot_loads_after_restart(
@@ -291,12 +492,16 @@ def test_database_mapping_validation_rejects_missing_chunk(
     retrieval_environment,
 ) -> None:
     session, provider, root = retrieval_environment
+    missing_chunk_id = uuid4()
     snapshot = DenseSnapshot(
         version=1,
         store=FaissStore.build([[1.0, 0.0]]),
-        chunk_ids=(uuid4(),),
+        chunk_ids=(missing_chunk_id,),
         embedding_model=provider.model,
         embedding_dimension=2,
+        sparse_store=BM25Store.build(["missing chunk"]),
+        sparse_chunk_ids=(missing_chunk_id,),
+        rrf_k=60,
     )
     service = RetrievalService(session, provider, root, snapshot_manager)
     with pytest.raises(SnapshotError, match="missing or inactive"):
@@ -314,4 +519,7 @@ def test_retrieval_status_reports_loaded_snapshot(
     )
     assert response.status_code == 200
     assert response.json()["available"] is True
+    assert response.json()["dense_available"] is True
+    assert response.json()["sparse_available"] is True
+    assert response.json()["fusion_strategy"] == "rrf"
     assert response.json()["snapshot_version"] == version
