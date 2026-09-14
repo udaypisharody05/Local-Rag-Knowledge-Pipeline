@@ -1,6 +1,6 @@
 # Local RAG Knowledge Pipeline
 
-A self-hosted knowledge pipeline for a future single-server Retrieval-Augmented Generation system. Phase 4 combines local semantic and keyword retrieval over ingested TXT, Markdown, and text-based PDF documents. Answer generation is **not** implemented yet.
+A self-hosted, local Retrieval-Augmented Generation pipeline. Phase 5 combines hybrid retrieval with bounded-context Ollama generation and application-verified citations over ingested TXT, Markdown, and text-based PDF documents.
 
 ## Phase 1 architecture
 
@@ -36,10 +36,13 @@ The `/ready` endpoint is intentionally protected because it reports infrastructu
 - Reciprocal Rank Fusion (RRF) hybrid search over dense and sparse rankings
 - One immutable snapshot version containing both FAISS and safely persisted BM25 data
 - Protected snapshot rebuild, dense-, sparse-, hybrid-search, and retrieval-status endpoints
+- Non-streaming grounded answers from a configurable local Ollama generation model
+- Deterministic source labels and structured citations verified against PostgreSQL metadata
+- Bounded prompt context and explicit handling for an empty usable context
 
 ## Not implemented yet
 
-OCR, repository/CSV/JSON ingestion, semantic chunking, reranking, grounded LLM answer generation, citations in generated answers, streaming, asynchronous ingestion/indexing, Celery, Redis, and evaluation are planned for later phases.
+OCR, repository/CSV/JSON ingestion, semantic chunking, reranking, streaming, asynchronous ingestion/indexing, Celery, Redis, and a formal evaluation framework are planned for later phases.
 
 ## Prerequisites
 
@@ -90,15 +93,16 @@ curl -H "X-API-Key: your-api-key" http://localhost:8000/documents
 
 ## Local Ollama and hybrid retrieval
 
-Install Ollama separately on the host, start it, and pull the configured local embedding model:
+Install Ollama separately on the host, start it, and pull the configured local embedding and generation models:
 
 ```bash
 ollama serve
 ollama pull nomic-embed-text
+ollama pull llama3.2:3b
 ollama list
 ```
 
-The model is controlled by `EMBEDDING_MODEL`. Docker defaults `OLLAMA_BASE_URL` to `http://host.docker.internal:11434`; native development defaults to `http://localhost:11434`. Change the URL in `.env` for another local networking arrangement. The API still starts and document ingestion remains available when Ollama is offline.
+The models are controlled independently by `EMBEDDING_MODEL` and `GENERATION_MODEL`. Docker defaults `OLLAMA_BASE_URL` to `http://host.docker.internal:11434`; native development defaults to `http://localhost:11434`. Change the URL in `.env` for another local networking arrangement. The API still starts and document ingestion remains available when Ollama is offline; generation failures return a sanitized service error and do not affect `/health`.
 
 Build a complete immutable snapshot from all active PostgreSQL chunks:
 
@@ -148,6 +152,65 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/search/hybrid -Headers
 
 Configuration defaults are `SPARSE_TOP_K=5`, `SPARSE_MAX_K=20`, `DENSE_CANDIDATE_K=20`, `SPARSE_CANDIDATE_K=20`, `HYBRID_TOP_K=5`, `HYBRID_MAX_K=20`, and `RRF_K=60`. All three search endpoints report the same active snapshot version.
 
+## Grounded query flow
+
+`POST /query` runs the existing hybrid search once, keeps results in rank order, selects at most `GENERATION_MAX_CONTEXT_CHUNKS` within `GENERATION_MAX_CONTEXT_CHARS`, assigns `[SOURCE_1]`, `[SOURCE_2]`, and so on, then sends the delimited context to Ollama. The default generation settings are:
+
+```dotenv
+GENERATION_MODEL=llama3.2:3b
+GENERATION_TEMPERATURE=0.1
+GENERATION_TIMEOUT_SECONDS=120
+GENERATION_MAX_CONTEXT_CHUNKS=5
+GENERATION_MAX_CONTEXT_CHARS=12000
+```
+
+Retrieved documents are treated as untrusted data. Before prompt rendering, a small deterministic sanitizer removes lines matching obvious instruction-injection phrases while preserving surrounding factual text; stored documents and retrieval indexes are unchanged. The system prompt separately tells the model that context is evidence only, to ignore document-borne commands or role changes, use only explicit supplied facts, avoid speculative conclusions, and cite every factual claim with supplied labels. This is lightweight defense-in-depth: prompt-injection risk is mitigated, not eliminated.
+
+Citation labels in the answer are parsed and checked against the application-owned label mapping; filenames, page numbers, document IDs, and chunk IDs always come from PostgreSQL rather than model output. If a substantive answer contains no valid citation, the service makes exactly one repair call using the same sanitized, verified context and asks for a concise cited rewrite without unsupported claims. If that repair remains uncited, the request fails safely instead of returning the factual draft as grounded. Genuine insufficient-context refusals may contain no citations and do not trigger repair.
+
+If retrieval produces no usable context, Ollama is not called and the API returns a static insufficient-context answer with no citations. If context exists but lacks the answer, the model is instructed to refuse concisely. Hallucinations are mitigated, not guaranteed to be eliminated.
+
+```bash
+curl -X POST http://localhost:8000/query \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"How does the project compare vectors?","k":5}'
+```
+
+PowerShell equivalent:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/query `
+  -Headers @{"X-API-Key"="your-api-key"} -ContentType "application/json" `
+  -Body '{"query":"How does the project compare vectors?","k":5}'
+```
+
+Example response shape:
+
+```json
+{
+  "query": "How does the project compare vectors?",
+  "answer": "The project uses normalized vectors with IndexFlatIP [SOURCE_1].",
+  "citations": [{
+    "source_id": "SOURCE_1",
+    "document_id": "verified-document-uuid",
+    "chunk_id": "verified-chunk-uuid",
+    "source_name": "retrieval.md",
+    "source_type": "md",
+    "page_number": null,
+    "section_title": "Dense retrieval",
+    "repo_relative_path": null
+  }],
+  "retrieval": {
+    "snapshot_version": 2,
+    "retrieved_chunk_ids": ["verified-chunk-uuid"],
+    "context_chunk_ids": ["verified-chunk-uuid"],
+    "fusion_strategy": "rrf"
+  },
+  "model": "llama3.2:3b"
+}
+```
+
 Manual verification sequence:
 
 ```bash
@@ -155,11 +218,16 @@ docker compose up --build -d
 docker compose exec api alembic upgrade head
 docker compose exec api pytest -v
 ollama pull nomic-embed-text
+ollama pull llama3.2:3b
 curl -X POST http://localhost:8000/retrieval/index/rebuild -H "X-API-Key: your-api-key"
 curl -X POST http://localhost:8000/search/dense -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"your question","k":5}'
 curl -X POST http://localhost:8000/search/sparse -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"IndexFlatIP PostgreSQL","k":5}'
 curl -X POST http://localhost:8000/search/hybrid -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"your question","k":5}'
+curl -X POST http://localhost:8000/query -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"your question","k":5}'
+curl -X POST http://localhost:8000/query -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"an unrelated question","k":5}'
 ```
+
+For each real answer, compare `citations` with the referenced documents and confirm `context_chunk_ids` belongs to the reported snapshot. An unrelated question may take the static no-context path or produce the model-level insufficient-context response because Phase 5 intentionally adds no uncalibrated relevance threshold.
 
 ## Local Python setup
 
@@ -223,8 +291,8 @@ Missing or invalid keys return `401`. A database failure returns `503` with a sa
 
 ## Current limitations
 
-Ingestion and full snapshot rebuilds are synchronous. PDFs are not OCR-processed, and there is no delete endpoint. Reranking, generated answers, citations in generated answers, streaming, and asynchronous ingestion/indexing are not implemented.
+Ingestion and full snapshot rebuilds are synchronous. PDFs are not OCR-processed, and there is no delete endpoint. Streaming/SSE, reranking, Celery/async indexing, repository ingestion, CSV/JSON ingestion, and a formal evaluation framework are not implemented.
 
 ## Next phase
 
-Evaluate dense, sparse, and hybrid retrieval before selecting and implementing a reranking approach in a later phase.
+Run the real local generation checks and establish a formal retrieval/generation evaluation baseline before selecting any later reranking or streaming work.

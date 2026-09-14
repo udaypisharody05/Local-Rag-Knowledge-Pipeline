@@ -8,6 +8,7 @@ from fastapi import FastAPI
 
 from app.api.documents import router as documents_router
 from app.api.health import router as health_router
+from app.api.query import router as query_router
 from app.api.retrieval import router as retrieval_router
 from app.core.config import settings
 from app.core.logging import configure_logging
@@ -45,3 +46,4 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.include_router(health_router)
 app.include_router(documents_router)
 app.include_router(retrieval_router)
+app.include_router(query_router)

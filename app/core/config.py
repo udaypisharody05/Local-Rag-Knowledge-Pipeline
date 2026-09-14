@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     hybrid_top_k: int = Field(default=5, gt=0)
     hybrid_max_k: int = Field(default=20, gt=0)
     rrf_k: int = Field(default=60, gt=0)
+    generation_model: str = Field(default="llama3.2:3b", min_length=1)
+    generation_temperature: float = Field(default=0.1, ge=0.0)
+    generation_timeout_seconds: float = Field(default=120.0, gt=0)
+    generation_max_context_chunks: int = Field(default=5, gt=0)
+    generation_max_context_chars: int = Field(default=12_000, gt=0)
     index_storage_root: Path = Path("storage/indexes/versions")
 
     @model_validator(mode="after")

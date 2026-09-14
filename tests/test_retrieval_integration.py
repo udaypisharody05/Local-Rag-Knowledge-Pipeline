@@ -11,10 +11,11 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_db, get_embedding_provider
+from app.api.dependencies import get_db, get_embedding_provider, get_generation_provider
 from app.core.config import settings
 from app.db.session import engine
 from app.embeddings import EmbeddingError
+from app.generation import INSUFFICIENT_CONTEXT_ANSWER
 from app.main import app
 from app.models import Document, DocumentChunk, RetrievalIndexVersion
 from app.retrieval import snapshot_manager
@@ -47,6 +48,19 @@ class DeterministicEmbeddingProvider:
 class FailingEmbeddingProvider(DeterministicEmbeddingProvider):
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         raise EmbeddingError("Deterministic embedding failure")
+
+
+@dataclass
+class FakeGenerationProvider:
+    model: str = "fake-generation-model"
+    answer: str = "Grounded fact [SOURCE_1]. Invalid [SOURCE_99]."
+
+    def __post_init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        self.calls.append((system_prompt, user_prompt))
+        return self.answer
 
 
 @pytest.fixture
@@ -523,3 +537,78 @@ def test_retrieval_status_reports_loaded_snapshot(
     assert response.json()["sparse_available"] is True
     assert response.json()["fusion_strategy"] == "rrf"
     assert response.json()["snapshot_version"] == version
+
+
+def test_query_uses_hybrid_context_and_returns_verified_citation(
+    retrieval_environment, client: TestClient, valid_api_key: str
+) -> None:
+    session, _, _ = retrieval_environment
+    document = _add_document(
+        session,
+        "generation.txt",
+        ["FAISS IndexFlatIP compares normalized vectors", "ocean water", "deployment guide"],
+    )
+    version = _rebuild(client, valid_api_key).json()["snapshot_version"]
+    provider = FakeGenerationProvider()
+    app.dependency_overrides[get_generation_provider] = lambda: provider
+    try:
+        response = client.post(
+            "/query",
+            headers={"X-API-Key": valid_api_key},
+            json={"query": "How are normalized vectors compared?", "k": 2},
+        )
+    finally:
+        app.dependency_overrides.pop(get_generation_provider, None)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["retrieval"]["snapshot_version"] == version
+    assert body["retrieval"]["context_chunk_ids"]
+    assert len(provider.calls) == 1
+    assert len(body["citations"]) == 1
+    assert body["citations"][0]["source_id"] == "SOURCE_1"
+    assert body["citations"][0]["document_id"] == str(document.id)
+    assert all(item["source_id"] != "SOURCE_99" for item in body["citations"])
+
+
+def test_query_deleted_content_never_reaches_generation_context(
+    retrieval_environment, client: TestClient, valid_api_key: str
+) -> None:
+    session, _, _ = retrieval_environment
+    document = _add_document(session, "deleted.txt", ["private deleted material"])
+    _rebuild(client, valid_api_key)
+    document.status = "DELETED"
+    document.deleted_at = datetime.now(UTC)
+    session.commit()
+    provider = FakeGenerationProvider()
+    app.dependency_overrides[get_generation_provider] = lambda: provider
+    try:
+        response = client.post(
+            "/query",
+            headers={"X-API-Key": valid_api_key},
+            json={"query": "What is the private deleted material?"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_generation_provider, None)
+    assert response.status_code == 200
+    assert response.json()["answer"] == INSUFFICIENT_CONTEXT_ANSWER
+    assert response.json()["citations"] == []
+    assert response.json()["retrieval"]["context_chunk_ids"] == []
+    assert provider.calls == []
+
+
+def test_query_without_active_snapshot_fails_cleanly(
+    retrieval_environment, client: TestClient, valid_api_key: str
+) -> None:
+    snapshot_manager.clear()
+    provider = FakeGenerationProvider()
+    app.dependency_overrides[get_generation_provider] = lambda: provider
+    try:
+        response = client.post(
+            "/query",
+            headers={"X-API-Key": valid_api_key},
+            json={"query": "question"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_generation_provider, None)
+    assert response.status_code == 503
+    assert provider.calls == []
