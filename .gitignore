@@ -11,6 +11,9 @@ storage/*
 !storage/documents/
 storage/documents/*
 !storage/documents/.gitkeep
+!storage/indexes/
+storage/indexes/*
+!storage/indexes/.gitkeep
 *.pyc
 .coverage
 htmlcov/

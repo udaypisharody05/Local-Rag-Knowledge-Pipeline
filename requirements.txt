@@ -9,3 +9,6 @@ pytest==9.1.1
 httpx==0.28.1
 python-multipart==0.0.32
 pypdf==6.18.1
+faiss-cpu==1.15.0
+numpy==2.5.3
+numpy==2.5.3

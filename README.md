@@ -1,6 +1,6 @@
 # Local RAG Knowledge Pipeline
 
-A self-hosted knowledge pipeline for a future single-server Retrieval-Augmented Generation system. Phase 2 adds synchronous, local ingestion for TXT, Markdown, and text-based PDF documents. Retrieval and generation are **not** implemented yet.
+A self-hosted knowledge pipeline for a future single-server Retrieval-Augmented Generation system. Phase 3 adds local Ollama embeddings and persistent exact dense retrieval over ingested TXT, Markdown, and text-based PDF documents. Answer generation is **not** implemented yet.
 
 ## Phase 1 architecture
 
@@ -29,10 +29,14 @@ The `/ready` endpoint is intentionally protected because it reports infrastructu
 - Content-based duplicate detection with `409 Conflict`
 - Safe UUID-based source storage and cleanup on failed ingestion
 - Authenticated document list and detail endpoints
+- Local, configurable Ollama embeddings through the direct `/api/embed` HTTP API
+- Exact FAISS `IndexFlatIP` search using L2-normalized vectors for cosine similarity
+- Immutable, persistent, versioned retrieval snapshots with PostgreSQL-controlled activation
+- Protected snapshot rebuild, dense-search, and retrieval-status endpoints
 
 ## Not implemented yet
 
-OCR, repository/CSV/JSON ingestion, semantic chunking, Ollama embeddings, FAISS, BM25, rank fusion, reranking, grounded generation, citations, streaming, Celery, Redis, and evaluation are planned for later phases.
+OCR, repository/CSV/JSON ingestion, semantic chunking, BM25, rank fusion, hybrid retrieval, reranking, grounded LLM answer generation, citations, streaming, asynchronous indexing, Celery, Redis, and evaluation are planned for later phases.
 
 ## Prerequisites
 
@@ -54,7 +58,7 @@ Then start the stack:
 docker compose up --build
 ```
 
-The API container runs `alembic upgrade head` before starting Uvicorn. PostgreSQL data and source documents are retained in the `postgres_data` and `document_storage` volumes.
+The API container runs `alembic upgrade head` before starting Uvicorn. PostgreSQL data, source documents, and FAISS snapshots are retained in separate Docker volumes.
 
 ## Ingestion configuration
 
@@ -79,6 +83,49 @@ List indexed documents without returning chunk text:
 
 ```bash
 curl -H "X-API-Key: your-api-key" http://localhost:8000/documents
+```
+
+## Local Ollama and dense retrieval
+
+Install Ollama separately on the host, start it, and pull the configured local embedding model:
+
+```bash
+ollama serve
+ollama pull nomic-embed-text
+ollama list
+```
+
+The model is controlled by `EMBEDDING_MODEL`. Docker defaults `OLLAMA_BASE_URL` to `http://host.docker.internal:11434`; native development defaults to `http://localhost:11434`. Change the URL in `.env` for another local networking arrangement. The API still starts and document ingestion remains available when Ollama is offline.
+
+Build a complete immutable snapshot from all active PostgreSQL chunks:
+
+```bash
+curl -X POST http://localhost:8000/retrieval/index/rebuild \
+  -H "X-API-Key: your-api-key"
+```
+
+Every rebuild creates a new directory under `storage/indexes/versions/` containing `faiss.index`, `faiss_mapping.json`, and `manifest.json`. A temporary snapshot is validated and atomically published before PostgreSQL deprecates the previous active version and activates the new one. Existing active snapshots remain usable if a rebuild fails.
+
+Run exact dense semantic search:
+
+```bash
+curl -X POST http://localhost:8000/search/dense \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"What is retrieval augmented generation?","k":5}'
+```
+
+FAISS positions map only to chunk UUIDs; returned text and source metadata are reloaded from PostgreSQL. `DENSE_TOP_K` defaults to 5 and `DENSE_MAX_K` defaults to 20. Check whether a snapshot is loaded with `GET /retrieval/status`.
+
+Manual verification sequence:
+
+```bash
+docker compose up --build -d
+docker compose exec api alembic upgrade head
+docker compose exec api pytest -v
+ollama pull nomic-embed-text
+curl -X POST http://localhost:8000/retrieval/index/rebuild -H "X-API-Key: your-api-key"
+curl -X POST http://localhost:8000/search/dense -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"your question","k":5}'
 ```
 
 ## Local Python setup
@@ -143,8 +190,8 @@ Missing or invalid keys return `401`. A database failure returns `503` with a sa
 
 ## Current limitations
 
-Ingestion is synchronous, PDFs are not OCR-processed, and there is no delete endpoint. No embeddings, retrieval index, question answering, or generated responses exist in Phase 2.
+Ingestion and index rebuilds are synchronous. PDFs are not OCR-processed, and there is no delete endpoint. Phase 3 provides dense retrieval only: BM25, hybrid fusion, reranking, LLM answer generation, citations, streaming, and asynchronous indexing are not implemented.
 
 ## Next phase
 
-Add local embeddings and retrieval indexing as a separate phase, using the persisted chunks without changing the ingestion API contract.
+Add BM25 and Reciprocal Rank Fusion as a separate hybrid-retrieval phase without changing the immutable dense snapshot contract.

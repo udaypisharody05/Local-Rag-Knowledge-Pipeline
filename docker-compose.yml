@@ -28,10 +28,18 @@ services:
       CHUNK_SIZE: ${CHUNK_SIZE:-1000}
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-150}
       STORAGE_ROOT: /app/storage/documents
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-60}
+      DENSE_TOP_K: ${DENSE_TOP_K:-5}
+      DENSE_MAX_K: ${DENSE_MAX_K:-20}
+      INDEX_STORAGE_ROOT: /app/storage/indexes/versions
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
       - document_storage:/app/storage/documents
+      - index_storage:/app/storage/indexes
     depends_on:
       postgres:
         condition: service_healthy
@@ -40,3 +48,4 @@ services:
 volumes:
   postgres_data:
   document_storage:
+  index_storage:

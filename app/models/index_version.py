@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, Text, func
+from sqlalchemy import DateTime, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -12,6 +12,14 @@ from app.db.base import Base
 
 class RetrievalIndexVersion(Base):
     __tablename__ = "retrieval_index_versions"
+    __table_args__ = (
+        Index(
+            "uq_retrieval_index_one_active",
+            "status",
+            unique=True,
+            postgresql_where=text("status = 'ACTIVATED'"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     version: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
