@@ -211,6 +211,49 @@ Example response shape:
 }
 ```
 
+## Streaming grounded queries
+
+`POST /query` remains the non-streaming endpoint with its single citation-repair attempt. `POST /query/stream` uses the same one-time hybrid retrieval, context limits, source labeling, and prompt-injection sanitization, then streams the local Ollama response using Server-Sent Events (SSE).
+
+Successful event order:
+
+```text
+event: start
+data: {"query":"...","snapshot_version":2,"model":"llama3.2:3b"}
+
+event: token
+data: {"text":"incremental text"}
+
+event: citations
+data: {"citations":[...]}
+
+event: metadata
+data: {"snapshot_version":2,"retrieved_chunk_ids":[],"context_chunk_ids":[],"fusion_strategy":"rrf","model":"llama3.2:3b"}
+
+event: done
+data: {}
+```
+
+Tokens are accumulated only for end-of-stream citation validation. Structured citations still come exclusively from the application-owned source mapping. Invalid labels are excluded. Unlike `/query`, streaming cannot retract an already-sent uncited answer, so a substantive response with no valid citation ends with a sanitized `error` event and no `citations`, `metadata`, or successful `done` event. A legitimate insufficient-context refusal completes normally with an empty citation list.
+
+If Ollama fails before or during token output, the stream sends one sanitized `error` event and terminates. Client disconnects stop consumption and close the upstream Ollama stream; no background generation job is retained. Streaming remains fully local through the configured Ollama host.
+
+```bash
+curl -N -X POST http://localhost:8000/query/stream \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"How does vector search work?","k":5}'
+```
+
+Windows PowerShell using the real curl executable:
+
+```powershell
+curl.exe --no-buffer -X POST http://localhost:8000/query/stream `
+  -H "X-API-Key: your-api-key" `
+  -H "Content-Type: application/json" `
+  -d '{"query":"How does vector search work?","k":5}'
+```
+
 Manual verification sequence:
 
 ```bash

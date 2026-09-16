@@ -1,6 +1,7 @@
 """Hybrid retrieval to bounded context to grounded generation orchestration."""
 
 from dataclasses import dataclass, replace
+from collections.abc import AsyncIterator
 from uuid import UUID
 
 from app.generation.base import GenerationError, GenerationProvider
@@ -37,6 +38,19 @@ class GroundedQueryResult:
     model: str
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedGroundedQuery:
+    query: str
+    snapshot_version: int
+    retrieved_chunk_ids: list[UUID]
+    sources: list[LabeledSource]
+    model: str
+
+    @property
+    def context_chunk_ids(self) -> list[UUID]:
+        return [source.chunk_id for source in self.sources]
+
+
 class GroundedGenerationService:
     def __init__(
         self,
@@ -56,6 +70,33 @@ class GroundedGenerationService:
         self.max_context_chars = max_context_chars
 
     def answer(self, query: str, k: int) -> GroundedQueryResult:
+        prepared = self.prepare(query, k)
+        if not prepared.sources:
+            return self._insufficient_result(prepared)
+
+        answer = self.provider.generate(
+            SYSTEM_PROMPT, build_user_prompt(prepared.query, prepared.sources)
+        )
+        citations = extract_verified_citations(answer, prepared.sources)
+        if not citations and not is_insufficient_context_answer(answer):
+            answer = self.provider.generate(
+                SYSTEM_PROMPT,
+                build_citation_repair_prompt(prepared.query, prepared.sources, answer),
+            )
+            citations = extract_verified_citations(answer, prepared.sources)
+            if not citations and not is_insufficient_context_answer(answer):
+                raise GenerationError(UNCITED_ANSWER_ERROR)
+        return GroundedQueryResult(
+            query=prepared.query,
+            answer=answer,
+            citations=citations,
+            snapshot_version=prepared.snapshot_version,
+            retrieved_chunk_ids=prepared.retrieved_chunk_ids,
+            context_chunk_ids=prepared.context_chunk_ids,
+            model=prepared.model,
+        )
+
+    def prepare(self, query: str, k: int) -> PreparedGroundedQuery:
         version, hits = self.retrieval.search_hybrid(
             query, k, self.dense_candidate_k, self.sparse_candidate_k
         )
@@ -66,35 +107,30 @@ class GroundedGenerationService:
             if (sanitized := sanitize_context_text(hit.text)).strip()
         ]
         sources = self._select_context(assign_source_labels(sanitized_hits))
-        if not sources:
-            return GroundedQueryResult(
-                query=query,
-                answer=INSUFFICIENT_CONTEXT_ANSWER,
-                citations=[],
-                snapshot_version=version,
-                retrieved_chunk_ids=retrieved_chunk_ids,
-                context_chunk_ids=[],
-                model=self.provider.model,
-            )
-
-        answer = self.provider.generate(SYSTEM_PROMPT, build_user_prompt(query, sources))
-        citations = extract_verified_citations(answer, sources)
-        if not citations and not _is_insufficient_context_answer(answer):
-            answer = self.provider.generate(
-                SYSTEM_PROMPT,
-                build_citation_repair_prompt(query, sources, answer),
-            )
-            citations = extract_verified_citations(answer, sources)
-            if not citations and not _is_insufficient_context_answer(answer):
-                raise GenerationError(UNCITED_ANSWER_ERROR)
-        return GroundedQueryResult(
+        return PreparedGroundedQuery(
             query=query,
-            answer=answer,
-            citations=citations,
             snapshot_version=version,
             retrieved_chunk_ids=retrieved_chunk_ids,
-            context_chunk_ids=[source.chunk_id for source in sources],
+            sources=sources,
             model=self.provider.model,
+        )
+
+    def stream(self, prepared: PreparedGroundedQuery) -> AsyncIterator[str]:
+        return self.provider.stream(
+            SYSTEM_PROMPT,
+            build_user_prompt(prepared.query, prepared.sources),
+        )
+
+    @staticmethod
+    def _insufficient_result(prepared: PreparedGroundedQuery) -> GroundedQueryResult:
+        return GroundedQueryResult(
+            query=prepared.query,
+            answer=INSUFFICIENT_CONTEXT_ANSWER,
+            citations=[],
+            snapshot_version=prepared.snapshot_version,
+            retrieved_chunk_ids=prepared.retrieved_chunk_ids,
+            context_chunk_ids=[],
+            model=prepared.model,
         )
 
     def _select_context(self, sources: list[LabeledSource]) -> list[LabeledSource]:
@@ -112,7 +148,7 @@ class GroundedGenerationService:
         return selected
 
 
-def _is_insufficient_context_answer(answer: str) -> bool:
+def is_insufficient_context_answer(answer: str) -> bool:
     normalized = " ".join(answer.lower().split())
     if "insufficient context" in normalized:
         return True

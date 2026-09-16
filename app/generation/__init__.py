@@ -6,6 +6,8 @@ from app.generation.service import (
     INSUFFICIENT_CONTEXT_ANSWER,
     GroundedGenerationService,
     GroundedQueryResult,
+    PreparedGroundedQuery,
+    is_insufficient_context_answer,
 )
 
 __all__ = [
@@ -13,6 +15,8 @@ __all__ = [
     "GenerationProvider",
     "GroundedGenerationService",
     "GroundedQueryResult",
+    "PreparedGroundedQuery",
     "INSUFFICIENT_CONTEXT_ANSWER",
     "OllamaGenerationProvider",
+    "is_insufficient_context_answer",
 ]
