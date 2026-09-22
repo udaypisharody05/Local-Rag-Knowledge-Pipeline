@@ -2,9 +2,16 @@
 
 import os
 
+from dotenv import load_dotenv
+
+external_database_url = os.environ.get("DATABASE_URL")
+load_dotenv()
 os.environ.setdefault("APP_ENV", "test")
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql+psycopg://rag:rag_password@localhost:5432/rag_db"
+os.environ.setdefault("API_KEY", "unit-test-placeholder")
+os.environ["DATABASE_URL"] = (
+    os.environ.get("TEST_DATABASE_URL")
+    or external_database_url
+    or "postgresql+psycopg://localhost/rag_test"
 )
 os.environ.setdefault("LOG_LEVEL", "WARNING")
 

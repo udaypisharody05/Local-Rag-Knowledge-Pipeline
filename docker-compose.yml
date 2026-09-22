@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_DB: rag_db
       POSTGRES_USER: rag
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag_password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -35,7 +35,7 @@ services:
       APP_NAME: ${APP_NAME:-Local RAG Knowledge Pipeline}
       APP_ENV: ${APP_ENV:-development}
       API_KEY: ${API_KEY:?Set API_KEY in .env}
-      DATABASE_URL: postgresql+psycopg://rag:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/rag_db
+      DATABASE_URL: postgresql+psycopg://rag:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/rag_db
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-10}
       CHUNK_SIZE: ${CHUNK_SIZE:-1000}
@@ -80,7 +80,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-development}
       API_KEY: ${API_KEY:?Set API_KEY in .env}
-      DATABASE_URL: postgresql+psycopg://rag:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/rag_db
+      DATABASE_URL: postgresql+psycopg://rag:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/rag_db
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-10}
       CHUNK_SIZE: ${CHUNK_SIZE:-1000}

@@ -1,2 +1,0 @@
-The embedding model used by the system is nomic-embed-text.
-Embeddings are generated locally through the Ollama /api/embed endpoint.

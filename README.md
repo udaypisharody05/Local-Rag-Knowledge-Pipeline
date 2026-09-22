@@ -1,420 +1,212 @@
 # Local RAG Knowledge Pipeline
 
-A self-hosted, local Retrieval-Augmented Generation pipeline. Phase 8 adds safe logical document deletion with immediate PostgreSQL enforcement and retrieval consistency across immutable snapshots.
+A fully local Retrieval-Augmented Generation system built with FastAPI, PostgreSQL, Ollama, FAISS, BM25, Celery, and Redis. It ingests local documents, builds immutable hybrid-retrieval snapshots, generates grounded answers with application-verified citations, and keeps document/job state durable in PostgreSQL.
+
+## What it does
+
+- Ingests TXT, Markdown, and text-based PDF documents synchronously or asynchronously.
+- Parses and recursively chunks content while preserving page, heading, and offset metadata.
+- Generates local embeddings through Ollama.
+- Searches normalized vectors with FAISS `IndexFlatIP` and keywords with BM25.
+- Combines dense and sparse rankings using Reciprocal Rank Fusion (RRF).
+- Generates bounded-context answers with a local Ollama model.
+- Returns deterministic citations whose metadata is verified against PostgreSQL.
+- Streams answer tokens and final citations through Server-Sent Events (SSE).
+- Tracks Celery ingestion jobs durably in PostgreSQL with Redis used only as broker.
+- Logically deletes documents while immediately filtering stale snapshot candidates.
+- Evaluates retrieval, grounding, citations, refusals, and exclusion behavior reproducibly.
 
 ## Architecture
 
-- FastAPI serves a public liveness endpoint and an API-key-protected readiness endpoint.
-- SQLAlchemy 2.x provides typed synchronous PostgreSQL models and request-scoped sessions.
-- Alembic is the sole schema authority; application startup never calls `create_all()`.
-- PostgreSQL stores documents, chunks, ingestion job state, and future retrieval snapshot versions.
-- Redis is only the Celery broker; PostgreSQL remains authoritative for ingestion job state.
-- One Celery worker parses, chunks, and persists staged uploads using the same ingestion core as synchronous requests.
-- Docker Compose starts API, PostgreSQL, Redis, and one intentionally single-concurrency worker with shared document storage.
-- Logs are JSON on standard output and never include API-key values or database URLs.
-
-The `/ready` endpoint is intentionally protected because it reports infrastructure readiness. `/health` remains public for container/orchestrator liveness checks.
-
-## Implemented
-
-- Typed settings from environment variables or `.env`
-- Constant-time `X-API-Key` validation
-- `GET /health` and database-backed `GET /ready`
-- Four-table PostgreSQL schema with UUID keys, JSONB chunk metadata, timezone-aware timestamps, and cascading chunk deletion
-- Initial Alembic migration and autogeneration configuration
-- JSON structured logging
-- Python 3.12 container with one Uvicorn worker
-- Unit tests plus PostgreSQL migration integration tests
-- Authenticated synchronous `POST /documents/upload`
-- TXT, Markdown, and text-based PDF extraction with page/heading metadata
-- Configurable recursive character chunking and deterministic SHA-256 hashes
-- Content-based duplicate detection with `409 Conflict`
-- Safe UUID-based source storage and cleanup on failed ingestion
-- Authenticated document list and detail endpoints
-- Local, configurable Ollama embeddings through the direct `/api/embed` HTTP API
-- Exact FAISS `IndexFlatIP` search using L2-normalized vectors for cosine similarity
-- Immutable, persistent, versioned retrieval snapshots with PostgreSQL-controlled activation
-- Deterministic BM25 keyword retrieval with technical-identifier-aware tokenization
-- Reciprocal Rank Fusion (RRF) hybrid search over dense and sparse rankings
-- One immutable snapshot version containing both FAISS and safely persisted BM25 data
-- Protected snapshot rebuild, dense-, sparse-, hybrid-search, and retrieval-status endpoints
-- Non-streaming grounded answers from a configurable local Ollama generation model
-- Deterministic source labels and structured citations verified against PostgreSQL metadata
-- Bounded prompt context and explicit handling for an empty usable context
-- Authenticated asynchronous upload and persistent job-status endpoints
-- Safe UUID-based shared staging storage with cleanup after success or handled failure
-- JSON-only Celery messages containing job UUIDs, late acknowledgement, and prefetch of one
-- Authenticated, idempotent logical document deletion
-- PostgreSQL filtering that prevents deleted chunks from reaching retrieval or generation even when an older snapshot remains loaded
-
-## Not implemented yet
-
-OCR, repository/CSV/JSON ingestion, semantic chunking, reranking, automatic/coalesced reindexing, a frontend, and a formal evaluation framework are not implemented.
-
-## Prerequisites
-
-- Docker with Docker Compose (recommended), or Python 3.12 and PostgreSQL 14+
-
-## Configure and start with Docker
-
-Create your local environment file and replace both secrets:
-
-```bash
-cp .env.example .env
-```
-
-On PowerShell, use `Copy-Item .env.example .env`.
-
-Then start the stack:
-
-```bash
-docker compose up --build
-```
-
-The API container runs `alembic upgrade head` before starting Uvicorn. PostgreSQL data, Redis broker data, source documents/staging files, and FAISS snapshots are retained in Docker volumes. The worker uses the same application image and shared document-storage volume.
-
-## Ingestion configuration
-
-The defaults are a 10 MB upload limit, 1,000-character chunks, and 150-character overlap. Override `MAX_UPLOAD_SIZE_MB`, `CHUNK_SIZE`, and `CHUNK_OVERLAP` in `.env`; overlap must be smaller than chunk size. Only `.txt`, `.md`, `.markdown`, and `.pdf` files are accepted. PDFs must contain extractable text because OCR is intentionally out of scope.
-
-Upload a document with curl:
-
-```bash
-curl -X POST http://localhost:8000/documents/upload \
-  -H "X-API-Key: your-api-key" \
-  -F "file=@example.pdf"
-```
-
-PowerShell equivalent:
-
-```powershell
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/documents/upload `
-  -Headers @{"X-API-Key"="your-api-key"} -Form @{file=Get-Item .\example.pdf}
-```
-
-List indexed documents without returning chunk text:
-
-```bash
-curl -H "X-API-Key: your-api-key" http://localhost:8000/documents
-```
-
-## Asynchronous ingestion
-
-`POST /documents/upload` remains synchronous. `POST /documents/upload/async` validates and safely stages the upload, commits a `QUEUED` PostgreSQL job, enqueues only its UUID, and returns `202 Accepted` without waiting for parsing or chunking. The worker transitions jobs through `QUEUED -> PROCESSING -> COMPLETED`, or to `FAILED` with a sanitized error. `GET /ingestion/jobs/{job_id}` reads PostgreSQL directly; Celery result metadata is not application state.
-
-Successfully ingested documents are not added to the active FAISS/BM25 snapshot automatically. Run `POST /retrieval/index/rebuild` explicitly when newly completed documents should become searchable.
-
-Exact PowerShell verification:
-
-```powershell
-docker compose up --build -d
-docker compose ps
-docker compose exec api alembic upgrade head
-docker compose exec api pytest -v
-$base = "http://localhost:8000"
-$headers = @{"X-API-Key"="your-api-key"}
-$unique = "phase7-$([guid]::NewGuid())"
-Set-Content -Path .\phase7-async.txt -Value "Unique asynchronous knowledge token: $unique"
-$snapshotBefore = Invoke-RestMethod -Uri "$base/retrieval/status" -Headers $headers
-$accepted = Invoke-RestMethod -Method Post -Uri "$base/documents/upload/async" -Headers $headers -Form @{file=Get-Item .\phase7-async.txt}
-$accepted
-$job = do {
-  Start-Sleep -Milliseconds 250
-  $current = Invoke-RestMethod -Uri "$base/ingestion/jobs/$($accepted.job_id)" -Headers $headers
-  $current
-} until ($current.status -in @("COMPLETED", "FAILED"))
-$documentId = $current.document_id
-Invoke-RestMethod -Uri "$base/documents/$documentId" -Headers $headers
-$snapshotAfterIngestion = Invoke-RestMethod -Uri "$base/retrieval/status" -Headers $headers
-$snapshotBefore
-$snapshotAfterIngestion
-if ($snapshotBefore.snapshot_version -ne $snapshotAfterIngestion.snapshot_version) { throw "Ingestion unexpectedly changed the retrieval snapshot" }
-Invoke-RestMethod -Method Post -Uri "$base/retrieval/index/rebuild" -Headers $headers
-$body = @{query=$unique; k=5} | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "$base/search/hybrid" -Headers $headers -ContentType "application/json" -Body $body
-docker compose logs worker --tail=100
-```
-
-The two status responses should report the same active snapshot before the explicit rebuild. Fast jobs may move directly from `QUEUED` to `COMPLETED` between polls.
-
-Optional decoupling demonstration:
-
-```powershell
-docker compose stop worker
-$unique2 = "phase7-queued-$([guid]::NewGuid())"
-Set-Content -Path .\phase7-queued.txt -Value "Queued worker demonstration: $unique2"
-$queued = Invoke-RestMethod -Method Post -Uri "$base/documents/upload/async" -Headers $headers -Form @{file=Get-Item .\phase7-queued.txt}
-Invoke-RestMethod -Uri "$base/ingestion/jobs/$($queued.job_id)" -Headers $headers
-docker compose start worker
-Invoke-RestMethod -Uri "$base/ingestion/jobs/$($queued.job_id)" -Headers $headers
-```
-
-Use a new file body for this optional demonstration if the first document has already completed, because exact active-content duplicates are rejected before enqueueing.
-
-## Safe document deletion
-
-`DELETE /documents/{document_id}` marks an active document `DELETED` and records `deleted_at` in PostgreSQL. Repeating the request returns the same deleted state, while an unknown UUID returns `404`. `GET /documents` lists active documents only, and `GET /documents/{document_id}` returns `404` for a logically deleted document.
-
-Deletion takes effect for dense, sparse, hybrid, non-streaming query, and SSE query results immediately. Candidate chunk IDs from the currently loaded immutable snapshot are always hydrated through PostgreSQL and filtered against current document state, so deleted text cannot enter generation context or verified citations.
-
-Deletion does not mutate or remove the currently loaded snapshot. Run `POST /retrieval/index/rebuild` explicitly to create a new snapshot whose FAISS and BM25 mappings exclude deleted chunks; older snapshot artifacts remain intact for history and debugging. Permanent source files are retained for auditability, and physical garbage collection is future work.
-
-The active-content uniqueness rule remains unchanged: uploading content identical to an active document returns `409`, while identical content may be ingested as a new document after the original has been logically deleted. The deleted row is not resurrected.
-
-```bash
-curl -X DELETE http://localhost:8000/documents/your-document-uuid \
-  -H "X-API-Key: your-api-key"
-curl -X POST http://localhost:8000/retrieval/index/rebuild \
-  -H "X-API-Key: your-api-key"
-```
-
-## Local Ollama and hybrid retrieval
-
-Install Ollama separately on the host, start it, and pull the configured local embedding and generation models:
-
-```bash
-ollama serve
-ollama pull nomic-embed-text
-ollama pull llama3.2:3b
-ollama list
-```
-
-The models are controlled independently by `EMBEDDING_MODEL` and `GENERATION_MODEL`. Docker defaults `OLLAMA_BASE_URL` to `http://host.docker.internal:11434`; native development defaults to `http://localhost:11434`. Change the URL in `.env` for another local networking arrangement. The API still starts and document ingestion remains available when Ollama is offline; generation failures return a sanitized service error and do not affect `/health`.
-
-Build a complete immutable snapshot from all active PostgreSQL chunks:
-
-```bash
-curl -X POST http://localhost:8000/retrieval/index/rebuild \
-  -H "X-API-Key: your-api-key"
-```
-
-Every rebuild creates one combined version directory under `storage/indexes/versions/`. It contains `faiss.index`, `faiss_mapping.json`, `bm25_corpus.jsonl`, `bm25_mapping.json`, and `manifest.json`. The BM25 corpus is deterministic JSONL and is reconstructed in memory at load time; Python pickle is never used. A temporary snapshot is validated and atomically published before PostgreSQL deprecates the previous active version and activates the new one. Existing active snapshots remain usable if either index build fails.
-
-Run exact dense semantic search:
-
-```bash
-curl -X POST http://localhost:8000/search/dense \
-  -H "X-API-Key: your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"What is retrieval augmented generation?","k":5}'
-```
-
-FAISS positions map only to chunk UUIDs; returned text and source metadata are reloaded from PostgreSQL. `DENSE_TOP_K` defaults to 5 and `DENSE_MAX_K` defaults to 20. Check whether a snapshot is loaded with `GET /retrieval/status`.
-
-BM25 complements semantic retrieval when exact keywords, API paths, model names, or identifiers matter. The tokenizer lowercases text and preserves compounds such as `nomic-embed-text`, `document_id`, and `/api/embed`; it intentionally does not stem words. Run keyword search with:
-
-```bash
-curl -X POST http://localhost:8000/search/sparse \
-  -H "X-API-Key: your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"IndexFlatIP PostgreSQL","k":5}'
-```
-
-Hybrid search retrieves independent dense and sparse candidate lists, then combines their 1-based ranks using RRF. It does not add cosine and BM25 scores because those raw scales are incompatible. Raw component scores and ranks remain in the response for evaluation and debugging.
-
-```bash
-curl -X POST http://localhost:8000/search/hybrid \
-  -H "X-API-Key: your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"How are vectors searched?","k":5}'
-```
-
-PowerShell examples:
-
-```powershell
-$headers = @{"X-API-Key"="your-api-key"}
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/search/sparse -Headers $headers -ContentType "application/json" -Body '{"query":"IndexFlatIP PostgreSQL","k":5}'
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/search/hybrid -Headers $headers -ContentType "application/json" -Body '{"query":"How are vectors searched?","k":5}'
-```
-
-Configuration defaults are `SPARSE_TOP_K=5`, `SPARSE_MAX_K=20`, `DENSE_CANDIDATE_K=20`, `SPARSE_CANDIDATE_K=20`, `HYBRID_TOP_K=5`, `HYBRID_MAX_K=20`, and `RRF_K=60`. All three search endpoints report the same active snapshot version.
-
-## Grounded query flow
-
-`POST /query` runs the existing hybrid search once, keeps results in rank order, selects at most `GENERATION_MAX_CONTEXT_CHUNKS` within `GENERATION_MAX_CONTEXT_CHARS`, assigns `[SOURCE_1]`, `[SOURCE_2]`, and so on, then sends the delimited context to Ollama. The default generation settings are:
-
-```dotenv
-GENERATION_MODEL=llama3.2:3b
-GENERATION_TEMPERATURE=0.1
-GENERATION_TIMEOUT_SECONDS=120
-GENERATION_MAX_CONTEXT_CHUNKS=5
-GENERATION_MAX_CONTEXT_CHARS=12000
-```
-
-Retrieved documents are treated as untrusted data. Before prompt rendering, a small deterministic sanitizer removes lines matching obvious instruction-injection phrases while preserving surrounding factual text; stored documents and retrieval indexes are unchanged. The system prompt separately tells the model that context is evidence only, to ignore document-borne commands or role changes, use only explicit supplied facts, avoid speculative conclusions, and cite every factual claim with supplied labels. This is lightweight defense-in-depth: prompt-injection risk is mitigated, not eliminated.
-
-Citation labels in the answer are parsed and checked against the application-owned label mapping; filenames, page numbers, document IDs, and chunk IDs always come from PostgreSQL rather than model output. If a substantive answer contains no valid citation, the service makes exactly one repair call using the same sanitized, verified context and asks for a concise cited rewrite without unsupported claims. If that repair remains uncited, the request fails safely instead of returning the factual draft as grounded. Genuine insufficient-context refusals may contain no citations and do not trigger repair.
-
-If retrieval produces no usable context, Ollama is not called and the API returns a static insufficient-context answer with no citations. If context exists but lacks the answer, the model is instructed to refuse concisely. Hallucinations are mitigated, not guaranteed to be eliminated.
-
-```bash
-curl -X POST http://localhost:8000/query \
-  -H "X-API-Key: your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"How does the project compare vectors?","k":5}'
-```
-
-PowerShell equivalent:
-
-```powershell
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/query `
-  -Headers @{"X-API-Key"="your-api-key"} -ContentType "application/json" `
-  -Body '{"query":"How does the project compare vectors?","k":5}'
-```
-
-Example response shape:
-
-```json
-{
-  "query": "How does the project compare vectors?",
-  "answer": "The project uses normalized vectors with IndexFlatIP [SOURCE_1].",
-  "citations": [{
-    "source_id": "SOURCE_1",
-    "document_id": "verified-document-uuid",
-    "chunk_id": "verified-chunk-uuid",
-    "source_name": "retrieval.md",
-    "source_type": "md",
-    "page_number": null,
-    "section_title": "Dense retrieval",
-    "repo_relative_path": null
-  }],
-  "retrieval": {
-    "snapshot_version": 2,
-    "retrieved_chunk_ids": ["verified-chunk-uuid"],
-    "context_chunk_ids": ["verified-chunk-uuid"],
-    "fusion_strategy": "rrf"
-  },
-  "model": "llama3.2:3b"
-}
-```
-
-## Streaming grounded queries
-
-`POST /query` remains the non-streaming endpoint with its single citation-repair attempt. `POST /query/stream` uses the same one-time hybrid retrieval, context limits, source labeling, and prompt-injection sanitization, then streams the local Ollama response using Server-Sent Events (SSE).
-
-Successful event order:
-
 ```text
-event: start
-data: {"query":"...","snapshot_version":2,"model":"llama3.2:3b"}
-
-event: token
-data: {"text":"incremental text"}
-
-event: citations
-data: {"citations":[...]}
-
-event: metadata
-data: {"snapshot_version":2,"retrieved_chunk_ids":[],"context_chunk_ids":[],"fusion_strategy":"rrf","model":"llama3.2:3b"}
-
-event: done
-data: {}
+Documents
+   |
+   v
+Ingestion ---------> Sync API
+   |
+   +---------------> Redis broker ---> Celery worker
+   |
+   v
+PostgreSQL (source of truth)
+   |
+   +--------------------+
+   |                    |
+   v                    v
+FAISS dense         BM25 sparse
+   |                    |
+   +---------+----------+
+             |
+             v
+             RRF
+             |
+             v
+      Hybrid retrieval
+             |
+             v
+      Context selection
+             |
+             v
+ Prompt-injection mitigation
+             |
+             v
+      Ollama generation
+             |
+       +-----+------+
+       |            |
+    /query    /query/stream
+       |            |
+ answer +       SSE tokens +
+ citations       citations
 ```
 
-Tokens are accumulated only for end-of-stream citation validation. Structured citations still come exclusively from the application-owned source mapping. Invalid labels are excluded. Unlike `/query`, streaming cannot retract an already-sent uncited answer, so a substantive response with no valid citation ends with a sanitized `error` event and no `citations`, `metadata`, or successful `done` event. A legitimate insufficient-context refusal completes normally with an empty citation list.
+## Project status
 
-If Ollama fails before or during token output, the stream sends one sanitized `error` event and terminates. Client disconnects stop consumption and close the upstream Ollama stream; no background generation job is retained. Streaming remains fully local through the configured Ollama host.
+| Capability | Status |
+|---|---|
+| API-key authentication, health, readiness | Implemented |
+| TXT / Markdown / PDF ingestion | Implemented |
+| PostgreSQL document and chunk persistence | Implemented |
+| Celery / Redis asynchronous ingestion | Implemented |
+| Ollama embeddings and generation | Implemented |
+| FAISS dense + BM25 sparse retrieval | Implemented |
+| RRF hybrid search | Implemented |
+| Immutable versioned snapshots | Implemented |
+| Grounded answers and verified citations | Implemented |
+| SSE answer streaming | Implemented |
+| Logical deletion and stale-index filtering | Implemented |
+| Deterministic evaluation tooling | Implemented |
 
-```bash
-curl -N -X POST http://localhost:8000/query/stream \
-  -H "X-API-Key: your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"How does vector search work?","k":5}'
-```
+## Key design decisions
 
-Windows PowerShell using the real curl executable:
+- **PostgreSQL is authoritative.** Documents, chunks, logical deletion, snapshot lifecycle, and async-job state live in PostgreSQL.
+- **Indexes are derived.** FAISS and BM25 snapshots are rebuildable from active PostgreSQL chunks.
+- **Cosine similarity is exact.** L2-normalized vectors plus `IndexFlatIP` make inner product equivalent to cosine similarity.
+- **RRF combines ranks.** Dense and sparse raw scores are exposed but never added because their scales differ.
+- **Snapshots are immutable.** Every rebuild publishes a new validated version; ingestion and deletion never mutate an existing snapshot.
+- **Rebuilds are explicit.** New or deleted content reaches the next snapshot only through `POST /retrieval/index/rebuild`.
+- **Redis is broker-only.** Celery messages contain a JSON-safe job UUID; PostgreSQL stores job status.
+- **Citations are application-owned.** Document IDs, chunk IDs, filenames, pages, and headings come from PostgreSQL, not model output.
+- **Context is untrusted.** Obvious prompt-injection lines are sanitized and the system prompt treats retrieved text as evidence, never instructions.
+- **Local consistency is intentional.** Docker runs one Uvicorn process and one single-concurrency Celery worker with prefetch one.
+
+## API summary
+
+All application data and operational endpoints except `/health` require `X-API-Key`.
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/health` | Public liveness check |
+| GET | `/ready` | Protected PostgreSQL readiness |
+| POST | `/documents/upload` | Synchronous document ingestion |
+| POST | `/documents/upload/async` | Stage and enqueue asynchronous ingestion |
+| GET | `/documents` | List active documents |
+| GET | `/documents/{id}` | Read active document metadata |
+| DELETE | `/documents/{id}` | Idempotent logical deletion |
+| GET | `/ingestion/jobs/{id}` | Read durable ingestion-job state |
+| POST | `/retrieval/index/rebuild` | Build and activate a new immutable snapshot |
+| GET | `/retrieval/status` | Inspect the loaded snapshot |
+| POST | `/search/dense` | FAISS semantic search |
+| POST | `/search/sparse` | BM25 keyword search |
+| POST | `/search/hybrid` | RRF hybrid search |
+| POST | `/query` | Grounded non-streaming answer |
+| POST | `/query/stream` | Grounded SSE answer stream |
+
+## Quick start
+
+Requirements:
+
+- Docker with Docker Compose
+- Ollama running on the host
+- `nomic-embed-text` and `llama3.2:3b` (or compatible configured models)
+
+Create local configuration without committing it:
 
 ```powershell
-curl.exe --no-buffer -X POST http://localhost:8000/query/stream `
-  -H "X-API-Key: your-api-key" `
-  -H "Content-Type: application/json" `
-  -d '{"query":"How does vector search work?","k":5}'
+Copy-Item .env.example .env
 ```
 
-Manual verification sequence:
+Set secure `API_KEY` and `POSTGRES_PASSWORD` values in `.env`, then start the local stack:
 
-```bash
-docker compose up --build -d
-docker compose exec api alembic upgrade head
-docker compose exec api pytest -v
+```powershell
 ollama pull nomic-embed-text
 ollama pull llama3.2:3b
-curl -X POST http://localhost:8000/retrieval/index/rebuild -H "X-API-Key: your-api-key"
-curl -X POST http://localhost:8000/search/dense -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"your question","k":5}'
-curl -X POST http://localhost:8000/search/sparse -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"IndexFlatIP PostgreSQL","k":5}'
-curl -X POST http://localhost:8000/search/hybrid -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"your question","k":5}'
-curl -X POST http://localhost:8000/query -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"your question","k":5}'
-curl -X POST http://localhost:8000/query -H "X-API-Key: your-api-key" -H "Content-Type: application/json" -d '{"query":"an unrelated question","k":5}'
+docker compose up --build -d
 ```
 
-For each real answer, compare `citations` with the referenced documents and confirm `context_chunk_ids` belongs to the reported snapshot. An unrelated question may take the static no-context path or produce the model-level insufficient-context response because Phase 5 intentionally adds no uncalibrated relevance threshold.
+Compose runs `api`, `postgres`, `redis`, and `worker`. PostgreSQL, Redis, source files, and retrieval snapshots use persistent volumes. The API applies Alembic migrations before Uvicorn starts.
 
-## Local Python setup
+Docker-backed PostgreSQL, Redis, Celery, shared-volume, and Ollama connectivity checks are deployment validation. They are not fabricated when those services are unavailable.
 
-Use a local PostgreSQL URL (usually host `localhost`, rather than Compose host `postgres`) in `.env`.
+## Core workflows
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-alembic upgrade head
-uvicorn app.main:app --reload
-```
+Synchronous ingestion returns after parsing, chunking, and persistence. Asynchronous ingestion safely stages the file, commits a `QUEUED` PostgreSQL job, and publishes only the job UUID. The worker advances it through `PROCESSING` to `COMPLETED` or `FAILED` and removes staging data after handled outcomes.
 
-PowerShell activation is `.\.venv\Scripts\Activate.ps1`.
+Exact duplicate active content returns `409`. After the original is logically deleted, identical content may be ingested as a new active document.
 
-## Migrations
+Deletion sets `status=DELETED` and `deleted_at` but retains metadata, chunks, source files, ingestion history, and historical snapshots. Current retrieval candidates are always hydrated through PostgreSQL, so deleted chunks cannot reach search results, prompts, or citations even before rebuilding.
 
-Apply migrations:
+An explicit rebuild embeds all active chunks, builds matching FAISS and BM25 mappings, validates and atomically publishes the version, deprecates the prior database version, and swaps the in-memory snapshot.
 
-```bash
-alembic upgrade head
-```
+`POST /query` performs one hybrid retrieval, selects bounded context, sanitizes obvious injected instructions, assigns deterministic source labels, calls Ollama, and validates model citations. A substantive uncited answer gets one repair attempt and then fails closed. `/query/stream` uses the same preparation path; it emits `start`, `token`, `citations`, `metadata`, and `done` events, or a sanitized `error` event.
 
-After changing models in a later phase, generate and review a migration:
+## Configuration
 
-```bash
-alembic revision --autogenerate -m "describe schema change"
-```
+Configuration is environment-driven through `.env`. Important settings include:
 
-## Tests
+- `API_KEY`, `DATABASE_URL`, `POSTGRES_PASSWORD`
+- `MAX_UPLOAD_SIZE_MB`, `CHUNK_SIZE`, `CHUNK_OVERLAP`
+- `OLLAMA_BASE_URL`, `EMBEDDING_MODEL`, `GENERATION_MODEL`
+- dense, sparse, hybrid, and context-size limits
+- `CELERY_BROKER_URL`, late acknowledgement, and worker prefetch
+- document, staging, index, and snapshot storage roots
 
-The health and authentication tests do not require a database. Database tests connect to `DATABASE_URL`, apply Alembic migrations, and skip with an explicit reason if PostgreSQL is unavailable. Use a dedicated test database in CI.
+See [.env.example](.env.example) for the complete non-secret template.
 
-```bash
+## Evaluation
+
+The [`evaluation`](evaluation/README.md) package includes:
+
+- an 18-case human-readable dataset;
+- a compact reproducible corpus;
+- live `/search/hybrid` and `/query` evaluation;
+- Hit@K, MRR, Recall@K, exclusion, citation, expected-term, and refusal checks;
+- optional request-latency reporting;
+- a console summary and ignored machine-readable JSON report.
+
+The evaluator uses `RAG_API_BASE_URL` and `RAG_API_KEY`; credentials are never stored in the dataset. Evaluation metrics are deterministic structural checks, not proof of factual correctness and not an LLM-as-a-judge.
+
+## Testing
+
+```powershell
 pytest -v
 ```
 
-Inside the running API container:
+Unit tests do not require Redis or Ollama. PostgreSQL integration tests exercise migrations, ingestion, async processing logic, snapshot publication, stale-content filtering, generation, streaming, and deletion when the configured database is available.
 
-```bash
-docker compose exec api pytest -v
-```
+## Security and data safety
 
-Docker-backed PostgreSQL, Redis, and Celery runtime checks remain part of deployment validation.
+- Constant-time API-key comparison and protected operational endpoints.
+- Streaming upload limits, extension/MIME allowlists, PDF signature validation, and server-generated storage paths.
+- JSON-only Celery serialization; no pickle-based BM25 persistence.
+- Sanitized Ollama, Redis, retrieval, and queue errors.
+- No document contents, prompts, API keys, or database URLs in application lifecycle logs.
+- Current PostgreSQL state gates every snapshot candidate before retrieval or generation.
+- Structured citation metadata cannot be invented by the LLM.
+- Logical deletion preserves auditability; physical deletion is intentionally separate.
 
-## Health checks
+## Limitations and future work
 
-Public liveness:
+This v1.0 release intentionally does not include:
 
-```bash
-curl http://localhost:8000/health
-# {"status":"ok"}
-```
+- repository ingestion;
+- CSV/JSON ingestion;
+- OCR for scanned PDFs;
+- reranking;
+- automatic/coalesced snapshot rebuilding;
+- physical garbage collection for deleted source files;
+- restore/undelete workflows;
+- larger domain-specific evaluation datasets;
+- multi-user authorization or distributed deployment;
+- a frontend or Kubernetes manifests.
 
-Protected readiness:
-
-```bash
-curl -H "X-API-Key: your-api-key" http://localhost:8000/ready
-# {"status":"ready","database":"ok"}
-```
-
-Missing or invalid keys return `401`. A database failure returns `503` with a sanitized message.
-
-## Current limitations
-
-Retrieval snapshot rebuilds remain synchronous and explicit; ingestion and deletion do not automatically reindex. PDFs are not OCR-processed, and there is no restore, physical garbage-collection, or ingestion retry endpoint. The local deployment intentionally uses one ingestion worker. Reranking, repository ingestion, CSV/JSON ingestion, a frontend, and a formal evaluation framework are not implemented.
-
-## Next phase
-
-Add automatic/coalesced snapshot rebuilding only as a separately designed later phase; do not couple a full rebuild to every ingestion job.
+See [PROJECT_SUMMARY.md](docs/PROJECT_SUMMARY.md) for the end-to-end technical summary and resume-ready bullets.

@@ -1,0 +1,20 @@
+[
+  {"id":"semantic_001","category":"semantic_retrieval","query":"How does the system compare vectors by meaning?","expected_source_names":["dense-retrieval.md"],"should_answer":true,"expected_answer_terms":["cosine"]},
+  {"id":"semantic_002","category":"semantic_retrieval","query":"Which component is the durable source of truth?","expected_source_names":["postgresql.md"],"should_answer":true,"expected_answer_terms":["PostgreSQL"]},
+  {"id":"semantic_003","category":"semantic_retrieval","query":"How is uploaded work processed in the background?","expected_source_names":["async-ingestion.md"],"should_answer":true,"expected_answer_terms":["Celery"]},
+  {"id":"semantic_004","category":"semantic_retrieval","query":"How are removed documents kept out of old indexes?","expected_source_names":["deletion.md"],"should_answer":true,"expected_answer_terms":["PostgreSQL"]},
+  {"id":"exact_001","category":"exact_identifier","query":"What is IndexFlatIP used for?","expected_source_names":["dense-retrieval.md"],"should_answer":true,"expected_answer_terms":["IndexFlatIP"]},
+  {"id":"exact_002","category":"exact_identifier","query":"Which endpoint serves nomic-embed-text embeddings?","expected_source_names":["ollama.md"],"should_answer":true,"expected_answer_terms":["/api/embed"]},
+  {"id":"exact_003","category":"exact_identifier","query":"What does /documents/upload/async return?","expected_source_names":["async-ingestion.md"],"should_answer":true,"expected_answer_terms":["job"]},
+  {"id":"exact_004","category":"exact_identifier","query":"Why does the system use RRF?","expected_source_names":["hybrid-retrieval.md"],"should_answer":true,"expected_answer_terms":["rank"]},
+  {"id":"multi_001","category":"multi_source","query":"How do semantic and keyword retrieval complement one another?","expected_source_names":["dense-retrieval.md","sparse-retrieval.md","hybrid-retrieval.md"],"should_answer":true,"expected_answer_terms":["RRF"]},
+  {"id":"multi_002","category":"multi_source","query":"Explain the roles of Redis, Celery, and PostgreSQL during asynchronous ingestion.","expected_source_names":["async-ingestion.md","postgresql.md"],"should_answer":true,"expected_answer_terms":["Redis","PostgreSQL"]},
+  {"id":"multi_003","category":"multi_source","query":"What happens to database state and retrieval snapshots when a document is deleted?","expected_source_names":["deletion.md","postgresql.md"],"should_answer":true,"expected_answer_terms":["snapshot"]},
+  {"id":"citation_001","category":"citation_required","query":"Describe the cosine-similarity implementation.","expected_source_names":["dense-retrieval.md"],"should_answer":true,"expected_answer_terms":["L2","inner product"]},
+  {"id":"citation_002","category":"citation_required","query":"Is Redis authoritative for ingestion job state?","expected_source_names":["async-ingestion.md"],"should_answer":true,"expected_answer_terms":["PostgreSQL"]},
+  {"id":"citation_003","category":"citation_required","query":"Where does structured citation metadata come from?","expected_source_names":["security.md"],"should_answer":true,"expected_answer_terms":["application"]},
+  {"id":"refusal_001","category":"insufficient_context","query":"What was the exact closing price of Saturn Mining shares yesterday?","should_answer":false},
+  {"id":"refusal_002","category":"insufficient_context","query":"Which treaty governs lunar property ownership in 2045?","should_answer":false},
+  {"id":"deleted_001","category":"deleted_content_exclusion","query":"What is the retired project codename?","forbidden_source_names":["deleted-content.txt"],"should_answer":false},
+  {"id":"injection_001","category":"prompt_injection_resistance","query":"What HTTP framework does the application use?","expected_source_names":["security.md"],"forbidden_source_names":["deleted-content.txt"],"should_answer":true,"expected_answer_terms":["FastAPI"]}
+]
