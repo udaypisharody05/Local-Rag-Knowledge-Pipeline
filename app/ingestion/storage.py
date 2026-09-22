@@ -54,3 +54,63 @@ class DocumentStorage:
         directory = self.root / str(document_id)
         if directory.parent == self.root and directory.exists():
             shutil.rmtree(directory)
+
+
+class JobStagingStorage:
+    """Server-generated staging paths shared by the API and ingestion worker."""
+
+    def __init__(self, root: Path, max_size_bytes: int) -> None:
+        self.root = root.resolve()
+        self.max_size_bytes = max_size_bytes
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def stage(self, source: BinaryIO, job_id: uuid.UUID, extension: str) -> StagedUpload:
+        directory = self._directory(job_id)
+        directory.mkdir(mode=0o750)
+        destination = directory / self._filename(extension)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with destination.open("xb") as output:
+                while block := source.read(1024 * 1024):
+                    size += len(block)
+                    if size > self.max_size_bytes:
+                        raise UploadTooLargeError
+                    digest.update(block)
+                    output.write(block)
+            return StagedUpload(destination, size, digest.hexdigest())
+        except Exception:
+            self.remove(job_id)
+            raise
+
+    def load(self, job_id: uuid.UUID, extension: str) -> StagedUpload:
+        path = self._directory(job_id) / self._filename(extension)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with path.open("rb") as source:
+                while block := source.read(1024 * 1024):
+                    size += len(block)
+                    if size > self.max_size_bytes:
+                        raise UploadTooLargeError
+                    digest.update(block)
+        except FileNotFoundError:
+            raise ValueError("Staged upload is unavailable") from None
+        return StagedUpload(path, size, digest.hexdigest())
+
+    def remove(self, job_id: uuid.UUID) -> None:
+        directory = self._directory(job_id)
+        if directory.exists():
+            shutil.rmtree(directory)
+
+    def _directory(self, job_id: uuid.UUID) -> Path:
+        directory = (self.root / str(job_id)).resolve()
+        if directory.parent != self.root:
+            raise ValueError("Invalid staging job identifier")
+        return directory
+
+    @staticmethod
+    def _filename(extension: str) -> str:
+        if extension not in {"txt", "md", "pdf"}:
+            raise ValueError("Invalid staged upload extension")
+        return f"original.{extension}"

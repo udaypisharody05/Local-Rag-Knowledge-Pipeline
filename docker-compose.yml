@@ -15,6 +15,19 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
   api:
     build: .
     command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"]
@@ -28,6 +41,10 @@ services:
       CHUNK_SIZE: ${CHUNK_SIZE:-1000}
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-150}
       STORAGE_ROOT: /app/storage/documents
+      STAGING_ROOT: /app/storage/documents/staging
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_TASK_ACKS_LATE: "true"
+      CELERY_WORKER_PREFETCH_MULTIPLIER: "1"
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
       EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
@@ -57,7 +74,34 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  worker:
+    build: .
+    command: ["celery", "-A", "app.worker.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=1", "--prefetch-multiplier=1"]
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      API_KEY: ${API_KEY:?Set API_KEY in .env}
+      DATABASE_URL: postgresql+psycopg://rag:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/rag_db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-10}
+      CHUNK_SIZE: ${CHUNK_SIZE:-1000}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-150}
+      STORAGE_ROOT: /app/storage/documents
+      STAGING_ROOT: /app/storage/documents/staging
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_TASK_ACKS_LATE: "true"
+      CELERY_WORKER_PREFETCH_MULTIPLIER: "1"
+      INDEX_STORAGE_ROOT: /app/storage/indexes/versions
+    volumes:
+      - document_storage:/app/storage/documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   document_storage:
   index_storage:
+  redis_data:

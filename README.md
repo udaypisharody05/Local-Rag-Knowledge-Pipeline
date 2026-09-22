@@ -1,14 +1,16 @@
 # Local RAG Knowledge Pipeline
 
-A self-hosted, local Retrieval-Augmented Generation pipeline. Phase 5 combines hybrid retrieval with bounded-context Ollama generation and application-verified citations over ingested TXT, Markdown, and text-based PDF documents.
+A self-hosted, local Retrieval-Augmented Generation pipeline. Phase 7 adds durable asynchronous document ingestion with Celery, Redis, and PostgreSQL-backed job state while preserving synchronous upload and the explicit retrieval-snapshot lifecycle.
 
-## Phase 1 architecture
+## Architecture
 
 - FastAPI serves a public liveness endpoint and an API-key-protected readiness endpoint.
 - SQLAlchemy 2.x provides typed synchronous PostgreSQL models and request-scoped sessions.
 - Alembic is the sole schema authority; application startup never calls `create_all()`.
 - PostgreSQL stores documents, chunks, ingestion job state, and future retrieval snapshot versions.
-- Docker Compose starts only the API and PostgreSQL, with persistent database storage and health-based startup ordering.
+- Redis is only the Celery broker; PostgreSQL remains authoritative for ingestion job state.
+- One Celery worker parses, chunks, and persists staged uploads using the same ingestion core as synchronous requests.
+- Docker Compose starts API, PostgreSQL, Redis, and one intentionally single-concurrency worker with shared document storage.
 - Logs are JSON on standard output and never include API-key values or database URLs.
 
 The `/ready` endpoint is intentionally protected because it reports infrastructure readiness. `/health` remains public for container/orchestrator liveness checks.
@@ -39,10 +41,13 @@ The `/ready` endpoint is intentionally protected because it reports infrastructu
 - Non-streaming grounded answers from a configurable local Ollama generation model
 - Deterministic source labels and structured citations verified against PostgreSQL metadata
 - Bounded prompt context and explicit handling for an empty usable context
+- Authenticated asynchronous upload and persistent job-status endpoints
+- Safe UUID-based shared staging storage with cleanup after success or handled failure
+- JSON-only Celery messages containing job UUIDs, late acknowledgement, and prefetch of one
 
 ## Not implemented yet
 
-OCR, repository/CSV/JSON ingestion, semantic chunking, reranking, streaming, asynchronous ingestion/indexing, Celery, Redis, and a formal evaluation framework are planned for later phases.
+OCR, repository/CSV/JSON ingestion, semantic chunking, reranking, automatic/coalesced reindexing, a frontend, and a formal evaluation framework are not implemented.
 
 ## Prerequisites
 
@@ -64,11 +69,11 @@ Then start the stack:
 docker compose up --build
 ```
 
-The API container runs `alembic upgrade head` before starting Uvicorn. PostgreSQL data, source documents, and FAISS snapshots are retained in separate Docker volumes.
+The API container runs `alembic upgrade head` before starting Uvicorn. PostgreSQL data, Redis broker data, source documents/staging files, and FAISS snapshots are retained in Docker volumes. The worker uses the same application image and shared document-storage volume.
 
 ## Ingestion configuration
 
-The defaults are a 10 MB upload limit, 1,000-character chunks, and 150-character overlap. Override `MAX_UPLOAD_SIZE_MB`, `CHUNK_SIZE`, and `CHUNK_OVERLAP` in `.env`; overlap must be smaller than chunk size. Only `.txt`, `.md`, and `.pdf` files are accepted. PDFs must contain extractable text because OCR is intentionally out of scope.
+The defaults are a 10 MB upload limit, 1,000-character chunks, and 150-character overlap. Override `MAX_UPLOAD_SIZE_MB`, `CHUNK_SIZE`, and `CHUNK_OVERLAP` in `.env`; overlap must be smaller than chunk size. Only `.txt`, `.md`, `.markdown`, and `.pdf` files are accepted. PDFs must contain extractable text because OCR is intentionally out of scope.
 
 Upload a document with curl:
 
@@ -90,6 +95,59 @@ List indexed documents without returning chunk text:
 ```bash
 curl -H "X-API-Key: your-api-key" http://localhost:8000/documents
 ```
+
+## Asynchronous ingestion
+
+`POST /documents/upload` remains synchronous. `POST /documents/upload/async` validates and safely stages the upload, commits a `QUEUED` PostgreSQL job, enqueues only its UUID, and returns `202 Accepted` without waiting for parsing or chunking. The worker transitions jobs through `QUEUED -> PROCESSING -> COMPLETED`, or to `FAILED` with a sanitized error. `GET /ingestion/jobs/{job_id}` reads PostgreSQL directly; Celery result metadata is not application state.
+
+Successfully ingested documents are not added to the active FAISS/BM25 snapshot automatically. Run `POST /retrieval/index/rebuild` explicitly when newly completed documents should become searchable.
+
+Exact PowerShell verification:
+
+```powershell
+docker compose up --build -d
+docker compose ps
+docker compose exec api alembic upgrade head
+docker compose exec api pytest -v
+$base = "http://localhost:8000"
+$headers = @{"X-API-Key"="your-api-key"}
+$unique = "phase7-$([guid]::NewGuid())"
+Set-Content -Path .\phase7-async.txt -Value "Unique asynchronous knowledge token: $unique"
+$snapshotBefore = Invoke-RestMethod -Uri "$base/retrieval/status" -Headers $headers
+$accepted = Invoke-RestMethod -Method Post -Uri "$base/documents/upload/async" -Headers $headers -Form @{file=Get-Item .\phase7-async.txt}
+$accepted
+$job = do {
+  Start-Sleep -Milliseconds 250
+  $current = Invoke-RestMethod -Uri "$base/ingestion/jobs/$($accepted.job_id)" -Headers $headers
+  $current
+} until ($current.status -in @("COMPLETED", "FAILED"))
+$documentId = $current.document_id
+Invoke-RestMethod -Uri "$base/documents/$documentId" -Headers $headers
+$snapshotAfterIngestion = Invoke-RestMethod -Uri "$base/retrieval/status" -Headers $headers
+$snapshotBefore
+$snapshotAfterIngestion
+if ($snapshotBefore.snapshot_version -ne $snapshotAfterIngestion.snapshot_version) { throw "Ingestion unexpectedly changed the retrieval snapshot" }
+Invoke-RestMethod -Method Post -Uri "$base/retrieval/index/rebuild" -Headers $headers
+$body = @{query=$unique; k=5} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "$base/search/hybrid" -Headers $headers -ContentType "application/json" -Body $body
+docker compose logs worker --tail=100
+```
+
+The two status responses should report the same active snapshot before the explicit rebuild. Fast jobs may move directly from `QUEUED` to `COMPLETED` between polls.
+
+Optional decoupling demonstration:
+
+```powershell
+docker compose stop worker
+$unique2 = "phase7-queued-$([guid]::NewGuid())"
+Set-Content -Path .\phase7-queued.txt -Value "Queued worker demonstration: $unique2"
+$queued = Invoke-RestMethod -Method Post -Uri "$base/documents/upload/async" -Headers $headers -Form @{file=Get-Item .\phase7-queued.txt}
+Invoke-RestMethod -Uri "$base/ingestion/jobs/$($queued.job_id)" -Headers $headers
+docker compose start worker
+Invoke-RestMethod -Uri "$base/ingestion/jobs/$($queued.job_id)" -Headers $headers
+```
+
+Use a new file body for this optional demonstration if the first document has already completed, because exact active-content duplicates are rejected before enqueueing.
 
 ## Local Ollama and hybrid retrieval
 
@@ -314,6 +372,8 @@ Inside the running API container:
 docker compose exec api pytest -v
 ```
 
+Docker-backed PostgreSQL, Redis, and Celery runtime checks remain part of deployment validation.
+
 ## Health checks
 
 Public liveness:
@@ -334,8 +394,8 @@ Missing or invalid keys return `401`. A database failure returns `503` with a sa
 
 ## Current limitations
 
-Ingestion and full snapshot rebuilds are synchronous. PDFs are not OCR-processed, and there is no delete endpoint. Streaming/SSE, reranking, Celery/async indexing, repository ingestion, CSV/JSON ingestion, and a formal evaluation framework are not implemented.
+Retrieval snapshot rebuilds remain synchronous and explicit; asynchronous ingestion does not automatically reindex. PDFs are not OCR-processed, and there is no delete/retry endpoint. The local deployment intentionally uses one ingestion worker. Reranking, repository ingestion, CSV/JSON ingestion, a frontend, and a formal evaluation framework are not implemented.
 
 ## Next phase
 
-Run the real local generation checks and establish a formal retrieval/generation evaluation baseline before selecting any later reranking or streaming work.
+Add automatic/coalesced snapshot rebuilding only as a separately designed later phase; do not couple a full rebuild to every ingestion job.

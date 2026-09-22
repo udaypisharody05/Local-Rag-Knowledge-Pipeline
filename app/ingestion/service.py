@@ -1,4 +1,4 @@
-"""Transactional orchestration for synchronous document ingestion."""
+"""Transactional orchestration shared by synchronous and worker ingestion."""
 
 import hashlib
 import json
@@ -54,13 +54,8 @@ class IngestionService:
         self.chunker = RecursiveCharacterChunker(settings.chunk_size, settings.chunk_overlap)
 
     def ingest(self, upload: UploadFile) -> UploadResponse:
-        filename, extension = self._validate_filename(upload.filename)
-        self._validate_declared_mime(extension, upload.content_type)
-
-        staged: StagedUpload | None = None
-        document_id: uuid.UUID | None = None
-        storage_created = False
-        completed = False
+        filename, extension = self.validate_filename(upload.filename)
+        self.validate_declared_mime(extension, upload.content_type)
         try:
             try:
                 staged = self.storage.stage(upload.file)
@@ -69,14 +64,23 @@ class IngestionService:
                     413,
                     f"File exceeds the {self.settings.max_upload_size_mb} MB upload limit",
                 ) from None
+            return self.ingest_staged(staged, filename, extension, commit=True)
+        except IngestionError:
+            self.db.rollback()
+            raise
 
-            if staged.size_bytes == 0:
-                raise IngestionError(400, "Uploaded file is empty")
-            self._validate_signature(extension, staged)
-
-            duplicate = self._find_duplicate(staged.content_hash)
+    def ingest_staged(
+        self, staged: StagedUpload, filename: str, extension: str, *, commit: bool
+    ) -> UploadResponse:
+        """Parse and persist a validated staged upload using the common ingestion path."""
+        document_id: uuid.UUID | None = None
+        storage_created = False
+        completed = False
+        try:
+            self.validate_staged(extension, staged)
+            duplicate = self.find_duplicate(staged.content_hash)
             if duplicate is not None:
-                raise self._duplicate_error(duplicate)
+                raise self.duplicate_error(duplicate)
 
             document_id = uuid.uuid4()
             stored_file = self.storage.finalize(staged, document_id, extension)
@@ -92,7 +96,9 @@ class IngestionService:
                 source_name=filename,
                 source_type=extension,
                 original_filename=filename,
-                storage_path=(PurePosixPath("documents") / str(document_id) / f"original.{extension}").as_posix(),
+                storage_path=(
+                    PurePosixPath("documents") / str(document_id) / f"original.{extension}"
+                ).as_posix(),
                 mime_type=CANONICAL_MIME_TYPES[extension],
                 size_bytes=staged.size_bytes,
                 content_hash=staged.content_hash,
@@ -127,7 +133,10 @@ class IngestionService:
                 chunk_count=len(chunks),
             )
             self.db.add(document)
-            self.db.commit()
+            if commit:
+                self.db.commit()
+            else:
+                self.db.flush()
             completed = True
             return response
         except IngestionError:
@@ -138,9 +147,9 @@ class IngestionService:
             raise IngestionError(422, str(exc)) from None
         except IntegrityError:
             self.db.rollback()
-            existing = self._find_duplicate(staged.content_hash) if staged else None
+            existing = self.find_duplicate(staged.content_hash)
             if existing is not None:
-                raise self._duplicate_error(existing) from None
+                raise self.duplicate_error(existing) from None
             logger.exception("document_ingestion_database_conflict")
             raise IngestionError(500, "Document ingestion failed") from None
         except Exception:
@@ -148,12 +157,11 @@ class IngestionService:
             logger.exception("document_ingestion_failed source_type=%s", extension)
             raise IngestionError(500, "Document ingestion failed") from None
         finally:
-            if staged is not None:
-                staged.path.unlink(missing_ok=True)
+            staged.path.unlink(missing_ok=True)
             if document_id is not None and storage_created and not completed:
                 self.storage.remove_document(document_id)
 
-    def _find_duplicate(self, content_hash: str) -> Document | None:
+    def find_duplicate(self, content_hash: str) -> Document | None:
         return self.db.scalar(
             select(Document).where(
                 Document.content_hash == content_hash,
@@ -162,7 +170,7 @@ class IngestionService:
         )
 
     @staticmethod
-    def _duplicate_error(document: Document) -> IngestionError:
+    def duplicate_error(document: Document) -> IngestionError:
         return IngestionError(
             409,
             "Document with identical content already exists",
@@ -170,7 +178,7 @@ class IngestionService:
         )
 
     @staticmethod
-    def _validate_filename(raw_filename: str | None) -> tuple[str, str]:
+    def validate_filename(raw_filename: str | None) -> tuple[str, str]:
         if not raw_filename:
             raise IngestionError(400, "A filename is required")
         filename = PurePosixPath(raw_filename.replace("\\", "/")).name.strip()
@@ -178,12 +186,13 @@ class IngestionService:
         if not filename or filename in {".", ".."}:
             raise IngestionError(400, "Filename is invalid")
         suffix = PurePosixPath(filename).suffix.lower()
-        if suffix not in {".txt", ".md", ".pdf"}:
+        if suffix not in {".txt", ".md", ".markdown", ".pdf"}:
             raise IngestionError(400, "Unsupported file type; use TXT, Markdown, or PDF")
-        return filename, suffix.removeprefix(".")
+        extension = suffix.removeprefix(".")
+        return filename, "md" if extension == "markdown" else extension
 
     @staticmethod
-    def _validate_declared_mime(extension: str, content_type: str | None) -> None:
+    def validate_declared_mime(extension: str, content_type: str | None) -> None:
         if content_type is None:
             return
         normalized = content_type.partition(";")[0].strip().lower()
@@ -191,7 +200,9 @@ class IngestionService:
             raise IngestionError(400, "File content type does not match its extension")
 
     @staticmethod
-    def _validate_signature(extension: str, staged: StagedUpload) -> None:
+    def validate_staged(extension: str, staged: StagedUpload) -> None:
+        if staged.size_bytes == 0:
+            raise IngestionError(400, "Uploaded file is empty")
         if extension == "pdf":
             with staged.path.open("rb") as source:
                 if source.read(5) != b"%PDF-":

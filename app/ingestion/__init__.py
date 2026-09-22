@@ -1,4 +1,4 @@
-"""Synchronous document ingestion for Phase 2."""
+"""Shared synchronous and asynchronous document ingestion core."""
 
 from app.ingestion.service import IngestionError, IngestionService
 

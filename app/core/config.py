@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     chunk_size: int = Field(default=1000, gt=0)
     chunk_overlap: int = Field(default=150, ge=0)
     storage_root: Path = Path("storage/documents")
+    staging_root: Path = Path("storage/documents/staging")
+    celery_broker_url: str = "redis://redis:6379/0"
+    celery_task_acks_late: bool = True
+    celery_worker_prefetch_multiplier: int = Field(default=1, gt=0)
     ollama_base_url: AnyHttpUrl = "http://localhost:11434"
     embedding_model: str = Field(default="nomic-embed-text", min_length=1)
     embedding_batch_size: int = Field(default=32, gt=0)

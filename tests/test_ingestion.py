@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -13,11 +14,12 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_db
+from app.api.dependencies import get_db, get_ingestion_enqueuer
 from app.core.config import settings
 from app.db.session import engine
 from app.main import app
-from app.models import Document, DocumentChunk
+from app.models import Document, DocumentChunk, IngestionJob
+from app.worker.tasks import IngestionJobProcessor
 
 
 def _text_pdf(text_value: str) -> bytes:
@@ -72,6 +74,7 @@ def ingestion_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Session:
         yield session
 
     monkeypatch.setattr(settings, "storage_root", tmp_path / "documents")
+    monkeypatch.setattr(settings, "staging_root", tmp_path / "documents" / "staging")
     app.dependency_overrides[get_db] = override_db
     try:
         yield session
@@ -257,3 +260,202 @@ def test_document_endpoints_require_authentication(
 ) -> None:
     response = getattr(client, method)(path, headers={"X-API-Key": "deliberately-wrong"}, **kwargs)
     assert response.status_code == 401
+
+
+class _QueuedTask:
+    id = "test-celery-task-id"
+
+
+def _async_upload(
+    client: TestClient,
+    valid_api_key: str,
+    filename: str,
+    content: bytes,
+    mime_type: str,
+    enqueued: list[str],
+):
+    def enqueue(job_id: str) -> _QueuedTask:
+        enqueued.append(job_id)
+        return _QueuedTask()
+
+    app.dependency_overrides[get_ingestion_enqueuer] = lambda: enqueue
+    try:
+        return client.post(
+            "/documents/upload/async",
+            headers={"X-API-Key": valid_api_key},
+            files={"file": (filename, content, mime_type)},
+        )
+    finally:
+        app.dependency_overrides.pop(get_ingestion_enqueuer, None)
+
+
+def test_async_upload_requires_authentication(client: TestClient) -> None:
+    response = client.post(
+        "/documents/upload/async",
+        headers={"X-API-Key": "deliberately-wrong"},
+        files={"file": ("notes.txt", b"secret", "text/plain")},
+    )
+    assert response.status_code == 401
+
+
+def test_async_upload_creates_queued_job_and_status_is_protected(
+    client: TestClient, valid_api_key: str, ingestion_db: Session
+) -> None:
+    enqueued: list[str] = []
+    response = _async_upload(
+        client, valid_api_key, "async.txt", b"Asynchronous content", "text/plain", enqueued
+    )
+    assert response.status_code == 202
+    assert response.json()["status"] == "QUEUED"
+    assert enqueued == [response.json()["job_id"]]
+
+    job_id = UUID(response.json()["job_id"])
+    job = ingestion_db.get(IngestionJob, job_id)
+    assert job is not None
+    assert job.status == "QUEUED"
+    assert job.celery_task_id == _QueuedTask.id
+
+    unauthorized = client.get(
+        f"/ingestion/jobs/{job_id}", headers={"X-API-Key": "deliberately-wrong"}
+    )
+    status = client.get(
+        f"/ingestion/jobs/{job_id}", headers={"X-API-Key": valid_api_key}
+    )
+    missing = client.get(
+        f"/ingestion/jobs/{uuid4()}", headers={"X-API-Key": valid_api_key}
+    )
+    assert unauthorized.status_code == 401
+    assert status.status_code == 200
+    assert status.json()["error"] is None
+    assert missing.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("state", "has_started", "has_completed", "error"),
+    [
+        ("PROCESSING", True, False, None),
+        ("COMPLETED", True, True, None),
+        ("FAILED", True, True, "Sanitized failure"),
+    ],
+)
+def test_job_status_endpoint_returns_persisted_states(
+    client: TestClient,
+    valid_api_key: str,
+    ingestion_db: Session,
+    state: str,
+    has_started: bool,
+    has_completed: bool,
+    error: str | None,
+) -> None:
+    now = datetime.now(UTC)
+    job = IngestionJob(
+        id=uuid4(),
+        job_type="DOCUMENT_UPLOAD",
+        status=state,
+        source_name=f"{state.lower()}.txt",
+        started_at=now if has_started else None,
+        completed_at=now if has_completed else None,
+        error_message=error,
+    )
+    ingestion_db.add(job)
+    ingestion_db.commit()
+    response = client.get(
+        f"/ingestion/jobs/{job.id}", headers={"X-API-Key": valid_api_key}
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == state
+    assert response.json()["error"] == error
+
+
+def test_async_worker_completes_job_and_duplicate_delivery_is_safe(
+    client: TestClient, valid_api_key: str, ingestion_db: Session
+) -> None:
+    enqueued: list[str] = []
+    response = _async_upload(
+        client,
+        valid_api_key,
+        "worker.md",
+        b"# Worker\nShared ingestion metadata.",
+        "text/markdown",
+        enqueued,
+    )
+    job_id = UUID(response.json()["job_id"])
+    processor = IngestionJobProcessor(ingestion_db, settings)
+    processor.process(job_id)
+
+    job = ingestion_db.get(IngestionJob, job_id)
+    assert job is not None
+    assert job.status == "COMPLETED"
+    assert job.started_at is not None
+    assert job.completed_at is not None
+    assert job.document_id is not None
+    document_count = len(ingestion_db.scalars(select(Document)).all())
+    document = ingestion_db.get(Document, job.document_id)
+    chunks = ingestion_db.scalars(
+        select(DocumentChunk).where(DocumentChunk.document_id == job.document_id)
+    ).all()
+    assert document is not None
+    assert document.parser_version == "markdown-v1"
+    assert chunks[0].section_title == "Worker"
+    assert not (settings.staging_root / str(job_id)).exists()
+
+    processor.process(job_id)
+    assert len(ingestion_db.scalars(select(Document)).all()) == document_count
+
+
+def test_async_worker_failure_is_sanitized_and_cleans_staging(
+    client: TestClient, valid_api_key: str, ingestion_db: Session
+) -> None:
+    response = _async_upload(
+        client, valid_api_key, "blank.pdf", _blank_pdf(), "application/pdf", []
+    )
+    job_id = UUID(response.json()["job_id"])
+    IngestionJobProcessor(ingestion_db, settings).process(job_id)
+    job = ingestion_db.get(IngestionJob, job_id)
+    assert job is not None
+    assert job.status == "FAILED"
+    assert job.document_id is None
+    assert job.error_message == "PDF contains no extractable text; OCR is not supported"
+    assert not (settings.staging_root / str(job_id)).exists()
+
+
+def test_async_known_duplicate_is_rejected_before_enqueue(
+    client: TestClient, valid_api_key: str, ingestion_db: Session
+) -> None:
+    content = b"Already persisted content"
+    uploaded = _upload(client, valid_api_key, "original.txt", content, "text/plain")
+    enqueued: list[str] = []
+    response = _async_upload(
+        client, valid_api_key, "duplicate.txt", content, "text/plain", enqueued
+    )
+    assert response.status_code == 409
+    assert response.json()["document_id"] == uploaded.json()["document_id"]
+    assert enqueued == []
+    assert not any(settings.staging_root.iterdir())
+
+
+def test_async_queue_failure_marks_job_failed_and_cleans_staging(
+    client: TestClient, valid_api_key: str, ingestion_db: Session
+) -> None:
+    def failing_enqueue(_: str) -> object:
+        raise ConnectionError("broker details must not escape")
+
+    app.dependency_overrides[get_ingestion_enqueuer] = lambda: failing_enqueue
+    try:
+        response = client.post(
+            "/documents/upload/async",
+            headers={"X-API-Key": valid_api_key},
+            files={"file": ("queue.txt", b"Queue failure", "text/plain")},
+        )
+    finally:
+        app.dependency_overrides.pop(get_ingestion_enqueuer, None)
+
+    job = ingestion_db.scalar(
+        select(IngestionJob).where(IngestionJob.source_name == "queue.txt")
+    )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Ingestion queue is unavailable"}
+    assert job is not None
+    assert job.status == "FAILED"
+    assert job.error_message == "Ingestion queue is unavailable"
+    assert not (settings.staging_root / str(job.id)).exists()

@@ -1,4 +1,4 @@
-"""Future asynchronous ingestion job state."""
+"""Persistent asynchronous ingestion job state."""
 
 import uuid
 from datetime import datetime
