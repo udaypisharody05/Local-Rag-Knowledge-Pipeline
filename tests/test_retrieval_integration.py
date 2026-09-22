@@ -22,7 +22,7 @@ from app.retrieval import snapshot_manager
 from app.retrieval.dense import FaissStore
 from app.retrieval.sparse import BM25Store, SparseStoreError
 from app.retrieval.service import RetrievalService, load_active_snapshot
-from app.retrieval.snapshot import DenseSnapshot, SnapshotError
+from app.retrieval.snapshot import DenseSnapshot, SnapshotError, SnapshotStorage
 
 
 @dataclass
@@ -61,6 +61,10 @@ class FakeGenerationProvider:
     def generate(self, system_prompt: str, user_prompt: str) -> str:
         self.calls.append((system_prompt, user_prompt))
         return self.answer
+
+    async def stream(self, system_prompt: str, user_prompt: str):
+        self.calls.append((system_prompt, user_prompt))
+        yield self.answer
 
 
 @pytest.fixture
@@ -576,9 +580,10 @@ def test_query_deleted_content_never_reaches_generation_context(
     session, _, _ = retrieval_environment
     document = _add_document(session, "deleted.txt", ["private deleted material"])
     _rebuild(client, valid_api_key)
-    document.status = "DELETED"
-    document.deleted_at = datetime.now(UTC)
-    session.commit()
+    deleted = client.delete(
+        f"/documents/{document.id}", headers={"X-API-Key": valid_api_key}
+    )
+    assert deleted.status_code == 200
     provider = FakeGenerationProvider()
     app.dependency_overrides[get_generation_provider] = lambda: provider
     try:
@@ -594,6 +599,89 @@ def test_query_deleted_content_never_reaches_generation_context(
     assert response.json()["citations"] == []
     assert response.json()["retrieval"]["context_chunk_ids"] == []
     assert provider.calls == []
+
+
+def test_streaming_query_deleted_content_never_reaches_context_or_citations(
+    retrieval_environment, client: TestClient, valid_api_key: str
+) -> None:
+    session, _, _ = retrieval_environment
+    document = _add_document(session, "deleted-stream.txt", ["private streaming material"])
+    _rebuild(client, valid_api_key)
+    deleted = client.delete(
+        f"/documents/{document.id}", headers={"X-API-Key": valid_api_key}
+    )
+    provider = FakeGenerationProvider()
+    app.dependency_overrides[get_generation_provider] = lambda: provider
+    try:
+        response = client.post(
+            "/query/stream",
+            headers={"X-API-Key": valid_api_key},
+            json={"query": "What is the private streaming material?"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_generation_provider, None)
+    assert deleted.status_code == 200
+    assert response.status_code == 200
+    assert INSUFFICIENT_CONTEXT_ANSWER in response.text
+    assert str(document.id) not in response.text
+    assert "SOURCE_1" not in response.text
+    assert provider.calls == []
+
+
+def test_delete_keeps_old_snapshot_loadable_and_rebuild_excludes_deleted_chunks(
+    retrieval_environment, client: TestClient, valid_api_key: str
+) -> None:
+    session, _, root = retrieval_environment
+    deleted_document = _add_document(
+        session, "deleted-snapshot.txt", ["apple phase eight deleted"]
+    )
+    active_document = _add_document(
+        session, "active-snapshot.txt", ["ocean phase eight retained"]
+    )
+    deleted_chunk_ids = {chunk.id for chunk in deleted_document.chunks}
+    active_chunk_ids = {chunk.id for chunk in active_document.chunks}
+    first = _rebuild(client, valid_api_key).json()
+    first_version = first["snapshot_version"]
+    historical_before_delete = SnapshotStorage(root).load(first_version)
+
+    deleted = client.delete(
+        f"/documents/{deleted_document.id}", headers={"X-API-Key": valid_api_key}
+    )
+    assert deleted.status_code == 200
+    assert snapshot_manager.get().version == first_version
+    assert deleted_chunk_ids.issubset(set(historical_before_delete.chunk_ids))
+
+    snapshot_manager.clear()
+    reloaded = load_active_snapshot(session, root, snapshot_manager)
+    assert reloaded is not None
+    assert reloaded.version == first_version
+    for path in ("/search/dense", "/search/sparse", "/search/hybrid"):
+        response = client.post(
+            path,
+            headers={"X-API-Key": valid_api_key},
+            json={"query": "apple phase eight", "k": 2},
+        )
+        assert response.status_code == 200
+        assert all(
+            item["document_id"] != str(deleted_document.id)
+            for item in response.json()["results"]
+        )
+
+    second = _rebuild(client, valid_api_key).json()
+    current = snapshot_manager.get()
+    historical_after_rebuild = SnapshotStorage(root).load(first_version)
+    assert second["snapshot_version"] > first_version
+    assert second["chunk_count"] == len(active_chunk_ids)
+    assert current is not None
+    assert set(current.chunk_ids) == active_chunk_ids
+    assert set(current.sparse_chunk_ids) == active_chunk_ids
+    assert deleted_chunk_ids.issubset(set(historical_after_rebuild.chunk_ids))
+    first_row = session.scalar(
+        select(RetrievalIndexVersion).where(
+            RetrievalIndexVersion.version == first_version
+        )
+    )
+    assert first_row is not None and first_row.status == "DEPRECATED"
 
 
 def test_query_without_active_snapshot_fails_cleanly(

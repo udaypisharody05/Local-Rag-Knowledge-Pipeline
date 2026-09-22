@@ -402,16 +402,12 @@ def load_active_snapshot(
     snapshot = SnapshotStorage(storage_root).load(row.version)
     if row.chunk_count != snapshot.chunk_count or row.embedding_model != snapshot.embedding_model:
         raise SnapshotError("Active snapshot does not match its database record")
-    valid_count = db.scalar(
-        select(func.count(DocumentChunk.id))
-        .join(Document)
-        .where(
-            DocumentChunk.id.in_(snapshot.chunk_ids),
-            Document.deleted_at.is_(None),
-            Document.status != "DELETED",
+    existing_count = db.scalar(
+        select(func.count(DocumentChunk.id)).where(
+            DocumentChunk.id.in_(snapshot.chunk_ids)
         )
     )
-    if valid_count != snapshot.chunk_count:
-        raise SnapshotError("Active snapshot maps missing or inactive chunks")
+    if existing_count != snapshot.chunk_count:
+        raise SnapshotError("Active snapshot maps missing chunks")
     manager.replace(snapshot)
     return snapshot

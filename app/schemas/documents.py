@@ -14,6 +14,11 @@ class UploadResponse(BaseModel):
     chunk_count: int
 
 
+class DeleteDocumentResponse(BaseModel):
+    document_id: UUID
+    status: str
+
+
 class DocumentSummary(BaseModel):
     id: UUID
     source_name: str

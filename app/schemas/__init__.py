@@ -1,6 +1,11 @@
 """Pydantic API schemas."""
 
-from app.schemas.documents import DocumentDetail, DocumentSummary, UploadResponse
+from app.schemas.documents import (
+    DeleteDocumentResponse,
+    DocumentDetail,
+    DocumentSummary,
+    UploadResponse,
+)
 from app.schemas.query import CitationResponse, QueryRequest, QueryResponse, QueryRetrievalMetadata
 from app.schemas.retrieval import (
     DenseSearchRequest,
@@ -21,6 +26,7 @@ __all__ = [
     "DenseSearchResponse",
     "DenseSearchResult",
     "CitationResponse",
+    "DeleteDocumentResponse",
     "HybridSearchRequest",
     "HybridSearchResponse",
     "HybridSearchResult",

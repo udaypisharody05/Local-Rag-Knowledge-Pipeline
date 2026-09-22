@@ -16,7 +16,12 @@ from app.core.security import require_api_key
 from app.ingestion import IngestionError, IngestionService
 from app.ingestion.storage import JobStagingStorage, UploadTooLargeError
 from app.models import Document, DocumentChunk, IngestionJob
-from app.schemas.documents import DocumentDetail, DocumentSummary, UploadResponse
+from app.schemas.documents import (
+    DeleteDocumentResponse,
+    DocumentDetail,
+    DocumentSummary,
+    UploadResponse,
+)
 from app.schemas.ingestion_jobs import AsyncUploadResponse
 
 logger = logging.getLogger(__name__)
@@ -135,6 +140,20 @@ def get_document(document_id: UUID, db: Session = Depends(get_db)) -> DocumentDe
         parser_version=document.parser_version,
         chunking_config_hash=document.chunking_config_hash,
     )
+
+
+@router.delete("/{document_id}", response_model=DeleteDocumentResponse)
+def delete_document(
+    document_id: UUID, db: Session = Depends(get_db)
+) -> DeleteDocumentResponse | JSONResponse:
+    document = db.get(Document, document_id)
+    if document is None:
+        return JSONResponse(status_code=404, content={"detail": "Document not found"})
+    if document.status != "DELETED" or document.deleted_at is None:
+        document.status = "DELETED"
+        document.deleted_at = document.deleted_at or datetime.now(UTC)
+        db.commit()
+    return DeleteDocumentResponse(document_id=document.id, status="DELETED")
 
 
 def _summary(document: Document, chunk_count: int) -> DocumentSummary:

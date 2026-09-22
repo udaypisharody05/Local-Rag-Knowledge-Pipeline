@@ -1,6 +1,6 @@
 # Local RAG Knowledge Pipeline
 
-A self-hosted, local Retrieval-Augmented Generation pipeline. Phase 7 adds durable asynchronous document ingestion with Celery, Redis, and PostgreSQL-backed job state while preserving synchronous upload and the explicit retrieval-snapshot lifecycle.
+A self-hosted, local Retrieval-Augmented Generation pipeline. Phase 8 adds safe logical document deletion with immediate PostgreSQL enforcement and retrieval consistency across immutable snapshots.
 
 ## Architecture
 
@@ -44,6 +44,8 @@ The `/ready` endpoint is intentionally protected because it reports infrastructu
 - Authenticated asynchronous upload and persistent job-status endpoints
 - Safe UUID-based shared staging storage with cleanup after success or handled failure
 - JSON-only Celery messages containing job UUIDs, late acknowledgement, and prefetch of one
+- Authenticated, idempotent logical document deletion
+- PostgreSQL filtering that prevents deleted chunks from reaching retrieval or generation even when an older snapshot remains loaded
 
 ## Not implemented yet
 
@@ -148,6 +150,23 @@ Invoke-RestMethod -Uri "$base/ingestion/jobs/$($queued.job_id)" -Headers $header
 ```
 
 Use a new file body for this optional demonstration if the first document has already completed, because exact active-content duplicates are rejected before enqueueing.
+
+## Safe document deletion
+
+`DELETE /documents/{document_id}` marks an active document `DELETED` and records `deleted_at` in PostgreSQL. Repeating the request returns the same deleted state, while an unknown UUID returns `404`. `GET /documents` lists active documents only, and `GET /documents/{document_id}` returns `404` for a logically deleted document.
+
+Deletion takes effect for dense, sparse, hybrid, non-streaming query, and SSE query results immediately. Candidate chunk IDs from the currently loaded immutable snapshot are always hydrated through PostgreSQL and filtered against current document state, so deleted text cannot enter generation context or verified citations.
+
+Deletion does not mutate or remove the currently loaded snapshot. Run `POST /retrieval/index/rebuild` explicitly to create a new snapshot whose FAISS and BM25 mappings exclude deleted chunks; older snapshot artifacts remain intact for history and debugging. Permanent source files are retained for auditability, and physical garbage collection is future work.
+
+The active-content uniqueness rule remains unchanged: uploading content identical to an active document returns `409`, while identical content may be ingested as a new document after the original has been logically deleted. The deleted row is not resurrected.
+
+```bash
+curl -X DELETE http://localhost:8000/documents/your-document-uuid \
+  -H "X-API-Key: your-api-key"
+curl -X POST http://localhost:8000/retrieval/index/rebuild \
+  -H "X-API-Key: your-api-key"
+```
 
 ## Local Ollama and hybrid retrieval
 
@@ -394,7 +413,7 @@ Missing or invalid keys return `401`. A database failure returns `503` with a sa
 
 ## Current limitations
 
-Retrieval snapshot rebuilds remain synchronous and explicit; asynchronous ingestion does not automatically reindex. PDFs are not OCR-processed, and there is no delete/retry endpoint. The local deployment intentionally uses one ingestion worker. Reranking, repository ingestion, CSV/JSON ingestion, a frontend, and a formal evaluation framework are not implemented.
+Retrieval snapshot rebuilds remain synchronous and explicit; ingestion and deletion do not automatically reindex. PDFs are not OCR-processed, and there is no restore, physical garbage-collection, or ingestion retry endpoint. The local deployment intentionally uses one ingestion worker. Reranking, repository ingestion, CSV/JSON ingestion, a frontend, and a formal evaluation framework are not implemented.
 
 ## Next phase
 

@@ -298,6 +298,71 @@ def test_async_upload_requires_authentication(client: TestClient) -> None:
     assert response.status_code == 401
 
 
+def test_delete_document_requires_authentication(client: TestClient) -> None:
+    response = client.delete(
+        f"/documents/{uuid4()}", headers={"X-API-Key": "deliberately-wrong"}
+    )
+    assert response.status_code == 401
+
+
+def test_delete_document_is_logical_idempotent_and_hidden_from_reads(
+    client: TestClient, valid_api_key: str, ingestion_db: Session
+) -> None:
+    uploaded = _upload(
+        client, valid_api_key, "delete-me.txt", b"Retained source content", "text/plain"
+    ).json()
+    document_id = UUID(uploaded["document_id"])
+    stored_file = settings.storage_root / str(document_id) / "original.txt"
+
+    deleted = client.delete(
+        f"/documents/{document_id}", headers={"X-API-Key": valid_api_key}
+    )
+    ingestion_db.expire_all()
+    document = ingestion_db.get(Document, document_id)
+    assert deleted.status_code == 200
+    assert deleted.json() == {"document_id": str(document_id), "status": "DELETED"}
+    assert document is not None
+    assert document.status == "DELETED"
+    assert document.deleted_at is not None
+    assert stored_file.is_file()
+
+    repeated = client.delete(
+        f"/documents/{document_id}", headers={"X-API-Key": valid_api_key}
+    )
+    listing = client.get("/documents", headers={"X-API-Key": valid_api_key})
+    detail = client.get(
+        f"/documents/{document_id}", headers={"X-API-Key": valid_api_key}
+    )
+    missing = client.delete(
+        f"/documents/{uuid4()}", headers={"X-API-Key": valid_api_key}
+    )
+    assert repeated.status_code == 200
+    assert repeated.json() == deleted.json()
+    assert all(item["id"] != str(document_id) for item in listing.json())
+    assert detail.status_code == 404
+    assert missing.status_code == 404
+
+
+def test_identical_content_can_be_reingested_after_logical_delete(
+    client: TestClient, valid_api_key: str, ingestion_db: Session
+) -> None:
+    content = b"Reusable content after deletion"
+    first = _upload(client, valid_api_key, "first.txt", content, "text/plain")
+    active_duplicate = _upload(
+        client, valid_api_key, "active-duplicate.txt", content, "text/plain"
+    )
+    deleted = client.delete(
+        f"/documents/{first.json()['document_id']}",
+        headers={"X-API-Key": valid_api_key},
+    )
+    replacement = _upload(client, valid_api_key, "replacement.txt", content, "text/plain")
+    assert first.status_code == 201
+    assert active_duplicate.status_code == 409
+    assert deleted.status_code == 200
+    assert replacement.status_code == 201
+    assert replacement.json()["document_id"] != first.json()["document_id"]
+
+
 def test_async_upload_creates_queued_job_and_status_is_protected(
     client: TestClient, valid_api_key: str, ingestion_db: Session
 ) -> None:
